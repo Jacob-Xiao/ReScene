@@ -1,0 +1,235 @@
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+
+class Llama_conversation_subpage extends StatefulWidget {
+  @override
+  _Llama_conversation_subpageState createState() => _Llama_conversation_subpageState();
+}
+
+class _Llama_conversation_subpageState extends State<Llama_conversation_subpage> {
+  final TextEditingController _adviceController = TextEditingController();
+  String _llamaResponse = '';
+  bool _isLoading = false;
+  final List<Map<String, String>> _conversationHistory = []; // 存储对话历史
+
+  Future<void> _sendFeedback(BuildContext context) async {
+    String advice = _adviceController.text.trim();
+    if (advice.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('The input cannot be empty!')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isLoading = true;
+    });
+
+    try {
+      // 添加用户消息到历史
+      _conversationHistory.add({
+        'role': 'user',
+        'content': advice,
+        'time': DateTime.now().toString(),
+      });
+
+      final response = await http.post(
+        Uri.parse('http://127.0.0.1:5000/submit_content'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          "model": "llama3",
+          "messages": [
+            {"role": "user", "content": advice}
+          ],
+          "stream": false
+        }),
+      );
+
+      if (response.statusCode == 200) {
+        final responseData = jsonDecode(response.body);
+        
+        String llamaContent = 'No response content received.';
+        if (responseData['api_response'] != null) {
+          final apiResponse = responseData['api_response'];
+          
+          // 根据Llama API的实际结构提取content
+          if (apiResponse['message'] != null && apiResponse['message']['content'] != null) {
+            llamaContent = apiResponse['message']['content'];
+          } else if (apiResponse['content'] != null) {
+            llamaContent = apiResponse['content'];
+          } else {
+            // 如果找不到content，显示整个api_response用于调试
+            llamaContent = 'Content not found in response. Full response: ${apiResponse.toString()}';
+          }
+        }
+
+        // 添加Llama回复到历史
+        _conversationHistory.add({
+          'role': 'assistant',
+          'content': llamaContent,
+          'time': DateTime.now().toString(),
+        });
+
+        setState(() {
+          _llamaResponse = llamaContent;
+        });
+        
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Success! Llama has replied.')),
+        );
+        _adviceController.clear();
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Submission failed. Status: ${response.statusCode}')),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Network error: $e')),
+      );
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Widget _buildMessageBubble(Map<String, String> message) {
+    bool isUser = message['role'] == 'user';
+    return Container(
+      margin: EdgeInsets.symmetric(vertical: 4.0),
+      padding: EdgeInsets.all(12.0),
+      decoration: BoxDecoration(
+        color: isUser ? Colors.blue.shade50 : Colors.green.shade50,
+        borderRadius: BorderRadius.circular(12.0),
+        border: Border.all(
+          color: isUser ? Colors.blue.shade100 : Colors.green.shade100,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                isUser ? Icons.person : Icons.smart_toy,
+                size: 16,
+                color: isUser ? Colors.blue : Colors.green,
+              ),
+              SizedBox(width: 8),
+              Text(
+                isUser ? 'You' : 'Llama',
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: isUser ? Colors.blue.shade800 : Colors.green.shade800,
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 8),
+          Text(
+            message['content']!,
+            style: TextStyle(fontSize: 14, height: 1.4),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Llama3.2-8B Chat'),
+        backgroundColor: Colors.blue.shade800,
+        foregroundColor: Colors.white,
+      ),
+      body: Padding(
+        padding: EdgeInsets.all(16.0),
+        child: Column(
+          children: <Widget>[
+            // 输入区域
+            Container(
+              height: 60.0,
+              child: TextField(
+                controller: _adviceController,
+                maxLines: null,
+                expands: true,
+                decoration: InputDecoration(
+                  labelText: 'Ask Llama anything...',
+                  border: OutlineInputBorder(),
+                  suffixIcon: IconButton(
+                    icon: Icon(Icons.send),
+                    onPressed: _isLoading ? null : () => _sendFeedback(context),
+                    color: _isLoading ? Colors.grey : Colors.blue,
+                  ),
+                ),
+                onSubmitted: _isLoading ? null : (_) => _sendFeedback(context),
+              ),
+            ),
+            SizedBox(height: 20),
+            
+            // 加载指示器
+            if (_isLoading)
+              Padding(
+                padding: EdgeInsets.symmetric(vertical: 10),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(width: 10),
+                    Text('Llama is thinking...'),
+                  ],
+                ),
+              ),
+            
+            SizedBox(height: 10),
+            
+            // 对话展示区域
+            Expanded(
+              child: Container(
+                width: double.infinity,
+                padding: EdgeInsets.all(16.0),
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey.shade300),
+                  borderRadius: BorderRadius.circular(12.0),
+                  color: Colors.grey.shade50,
+                ),
+                child: _conversationHistory.isEmpty
+                    ? Center(
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            Icon(
+                              Icons.chat_bubble_outline,
+                              size: 64,
+                              color: Colors.grey.shade400,
+                            ),
+                            SizedBox(height: 16),
+                            Text(
+                              'Start a conversation with Llama!',
+                              style: TextStyle(
+                                color: Colors.grey,
+                                fontSize: 16,
+                                fontStyle: FontStyle.italic,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    : ListView.builder(
+                        reverse: false,
+                        itemCount: _conversationHistory.length,
+                        itemBuilder: (context, index) {
+                          return _buildMessageBubble(_conversationHistory[index]);
+                        },
+                      ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
