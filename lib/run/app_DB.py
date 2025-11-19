@@ -2,13 +2,17 @@ import sys
 import os
 from cProfile import label
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import base64
 from openai import OpenAI
 from datetime import datetime
 import tempfile
 from dotenv import load_dotenv
 
+# --- 新增依赖 ---
+import json
+import mysql.connector
+from mysql.connector import pooling
 
 # 添加正确的 ultralytics 路径到 Python 路径
 correct_ultralytics_path = 'C:/Users/30583/Desktop/PY/ultralytics-main'
@@ -23,14 +27,11 @@ print("当前Python路径:")
 for path in sys.path[:3]:  # 只显示前3个
     print(f"  - {path}")
 
-from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from ultralytics import YOLO
 import cv2
 import numpy as np
 import io
-import base64
-import os
 from PIL import Image
 import time
 import torch
@@ -51,13 +52,138 @@ print(f"模型类别: {model.names}")
 os.makedirs('uploads', exist_ok=True)
 os.makedirs('results', exist_ok=True)
 
+# 加载 env（保留你原来的路径）
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "C:/Users/30583/Desktop/API/.env"))
 # 初始化OpenAI客户端
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
 )
 
+# ---------------- MySQL 配置（使用你给的凭据） ----------------
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST"),
+    "user": os.getenv("DB_USER"),
+    "password": os.getenv("DB_PASSWORD"),
+    "database": os.getenv("DB_NAME"),
+    "charset": os.getenv("DB_CHARSET", "utf8mb4"),
+}
 
+
+# 我们会在启动时确保数据库与表存在
+def ensure_database_and_tables():
+    try:
+        # 先连接到 MySQL（不指定数据库），以便创建数据库（如果不存在）
+        tmp_conn = mysql.connector.connect(
+            host=DB_CONFIG['host'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            charset=DB_CONFIG.get('charset', 'utf8mb4'),
+            use_unicode=True
+        )
+        tmp_cursor = tmp_conn.cursor()
+        tmp_cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{DB_CONFIG['database']}` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;")
+        tmp_conn.commit()
+        tmp_cursor.close()
+        tmp_conn.close()
+    except Exception as e:
+        print(f"[DB Init] 创建数据库失败: {e}")
+        raise
+
+    # 现在创建连接池（会在模块全局中赋值）
+    global connection_pool
+    try:
+        connection_pool = pooling.MySQLConnectionPool(
+            pool_name="mypool",
+            pool_size=5,
+            host=DB_CONFIG['host'],
+            user=DB_CONFIG['user'],
+            password=DB_CONFIG['password'],
+            database=DB_CONFIG['database'],
+            charset=DB_CONFIG.get('charset', 'utf8mb4'),
+            use_unicode=True
+        )
+    except Exception as e:
+        print(f"[DB Init] 创建连接池失败: {e}")
+        raise
+
+    # 创建表
+    try:
+        conn = connection_pool.get_connection()
+        cursor = conn.cursor()
+        create_gpt_table = """
+        CREATE TABLE IF NOT EXISTS gpt_image_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            prompt TEXT,
+            user_image_longtext LONGTEXT,
+            output_image_longtext LONGTEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) CHARACTER SET = utf8mb4;
+        """
+        create_yolo_table = """
+        CREATE TABLE IF NOT EXISTS yolo_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            object_count INT,
+            detections JSON,
+            input_image_longtext LONGTEXT,
+            segmented_image_longtext LONGTEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) CHARACTER SET = utf8mb4;
+        """
+        cursor.execute(create_gpt_table)
+        cursor.execute(create_yolo_table)
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("[DB Init] 数据库与表已确认存在。")
+    except Exception as e:
+        print(f"[DB Init] 创建表失败: {e}")
+        raise
+
+# 立即确保数据库与表
+ensure_database_and_tables()
+
+# ----------------- 数据库写入函数 -----------------
+def insert_gpt_log(prompt, user_img_b64, output_img_b64):
+    try:
+        conn = connection_pool.get_connection()
+        cursor = conn.cursor()
+        sql = """
+        INSERT INTO gpt_image_logs (prompt, user_image_longtext, output_image_longtext)
+        VALUES (%s, %s, %s)
+        """
+        cursor.execute(sql, (prompt, user_img_b64, output_img_b64))
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] insert_gpt_log 失败: {e}")
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except:
+            pass
+
+def insert_yolo_log(object_count, detections, input_img_b64, segmented_img_b64):
+    try:
+        conn = connection_pool.get_connection()
+        cursor = conn.cursor()
+        sql = """
+        INSERT INTO yolo_logs (object_count, detections, input_image_longtext, segmented_image_longtext)
+        VALUES (%s, %s, %s, %s)
+        """
+        # detections 存为 JSON 字符串
+        det_json = json.dumps(detections, ensure_ascii=False)
+        cursor.execute(sql, (object_count, det_json, input_img_b64, segmented_img_b64))
+        conn.commit()
+    except Exception as e:
+        print(f"[DB] insert_yolo_log 失败: {e}")
+    finally:
+        try:
+            cursor.close()
+            conn.close()
+        except:
+            pass
+
+# ----------------- 你的图像处理函数（保持不变，仅进行了小修正） -----------------
 def process_image_segmentation_only(image_data):
     """
     处理上传的图片并进行YOLO推理，只返回分割后的透明背景图像
@@ -119,11 +245,6 @@ def process_image_segmentation_only(image_data):
             segmented_img = Image.fromarray(rgba_array, 'RGBA')
             print("未检测到任何目标")
 
-        # 保存结果图片
-        # timestamp = int(time.time())
-        # result_path = f'results/segmented_only_{timestamp}.png'
-        # segmented_img.save(result_path, 'PNG')
-
         # 获取检测信息
         detection_info = []
         if hasattr(result, 'boxes') and result.boxes is not None:
@@ -147,7 +268,6 @@ def process_image_segmentation_only(image_data):
             'success': True,
             'segmented_image': segmented_img,
             'detections': detection_info,
-            # 'result_path': result_path,
             'original_shape': orig_img.shape,
             'has_segmentation': result.masks is not None,
             'object_count': len(masks) if result.masks is not None else 0
@@ -159,7 +279,6 @@ def process_image_segmentation_only(image_data):
             'success': False,
             'error': str(e)
         }
-
 
 def process_image_original(image_data):
     """
@@ -197,11 +316,6 @@ def process_image_original(image_data):
         # 转换为PIL Image
         pil_img = Image.fromarray(annotated_img_rgb)
 
-        # 保存结果图片
-        # timestamp = int(time.time())
-        # result_path = f'results/result_{timestamp}.jpg'
-        # pil_img.save(result_path, quality=95)
-
         # 获取检测信息
         detection_info = []
         if hasattr(result, 'boxes') and result.boxes is not None:
@@ -225,7 +339,6 @@ def process_image_original(image_data):
             'success': True,
             'annotated_image': pil_img,
             'detections': detection_info,
-            # 'result_path': result_path,
             'original_shape': img.shape,
             'processed_shape': annotated_img.shape
         }
@@ -236,7 +349,6 @@ def process_image_original(image_data):
             'success': False,
             'error': str(e)
         }
-
 
 def base64_to_temp_file(image_base64):
     """将base64转换为临时文件路径"""
@@ -253,7 +365,7 @@ def base64_to_temp_file(image_base64):
 
     return temp_file_path
 
-
+# ----------------- API: /yolo_seg -----------------
 @app.route('/yolo_seg', methods=['POST'])
 def yolo_segmentation_transparent():
     """
@@ -314,7 +426,6 @@ def yolo_segmentation_transparent():
             'message': '分割完成',
             'image': f"data:image/png;base64,{base64_image}",
             'detections': result['detections'],
-            # 'result_path': result['result_path'],
             'original_shape': result['original_shape'],
             'has_segmentation': result['has_segmentation'],
             'object_count': result['object_count'],
@@ -322,6 +433,28 @@ def yolo_segmentation_transparent():
             'timestamp': time.time(),
             'image_type': 'transparent_png'
         }
+
+        # --- 写入数据库 ---
+        try:
+            # 规范化 input image 为 base64 字符串，便于存储
+            if isinstance(image_data, bytes):
+                input_b64 = base64.b64encode(image_data).decode('utf-8')
+            else:
+                # 可能已经是 data:image/... 前缀或纯 b64
+                if isinstance(image_data, str) and image_data.startswith('data:'):
+                    input_b64 = image_data.split(',', 1)[1]
+                else:
+                    input_b64 = image_data if isinstance(image_data, str) else base64.b64encode(image_data).decode('utf-8')
+
+            insert_yolo_log(
+                object_count=result['object_count'],
+                detections=result['detections'],
+                input_img_b64=input_b64,
+                segmented_img_b64=base64_image
+            )
+            print("[DB] YOLO 记录已写入")
+        except Exception as e:
+            print(f"[DB] 写入 YOLO 记录出错: {e}")
 
         print(f"透明分割请求处理完成，耗时: {processing_time}秒")
         return jsonify(response_data)
@@ -335,7 +468,7 @@ def yolo_segmentation_transparent():
             'processing_time': error_time
         }), 500
 
-
+# ----------------- 其他 API 保持不变 -----------------
 @app.route('/get_image/<filename>', methods=['GET'])
 def get_image(filename):
     """
@@ -350,7 +483,6 @@ def get_image(filename):
     except FileNotFoundError:
         return jsonify({'error': '图片未找到'}), 404
 
-
 @app.route('/health', methods=['GET'])
 def health_check():
     """
@@ -362,7 +494,6 @@ def health_check():
         'model_classes': len(model.names) if model else 0,
         'timestamp': time.time()
     })
-
 
 @app.route('/model_info', methods=['GET'])
 def model_info():
@@ -382,7 +513,6 @@ def model_info():
             'error': str(e)
         }), 500
 
-
 # 错误处理
 @app.errorhandler(413)
 def too_large(e):
@@ -391,14 +521,12 @@ def too_large(e):
         'error': '文件太大'
     }), 413
 
-
 @app.errorhandler(500)
 def internal_error(e):
     return jsonify({
         'success': False,
         'error': '内部服务器错误'
     }), 500
-
 
 @app.route('/submit_content', methods=['POST'])
 def submit_content():
@@ -411,7 +539,7 @@ def submit_content():
             return jsonify({'error': 'No JSON data received'}), 400
 
         # 提取具体字段
-        model = data.get('model')
+        model_field = data.get('model')
         messages = data.get('messages', [])
         stream = data.get('stream', False)
 
@@ -424,7 +552,7 @@ def submit_content():
 
         # 打印接收到的数据（调试用）
         print("=== 接收到的原始数据 ===")
-        print(f"Model: {model}")
+        print(f"Model: {model_field}")
         print(f"Messages: {messages}")
         print(f"Stream: {stream}")
         print(f"User Message: {user_message}")
@@ -447,17 +575,12 @@ def submit_content():
                 print("\n=== 目标API返回的数据 ===")
                 print(f"完整响应: {result}")
 
-                # 可以根据实际响应结构提取需要的信息
-                # 例如，如果响应中有'message'字段
-                if 'message' in result:
-                    print(f"消息内容: {result['message']}")
-
                 # 返回给前端的响应
                 return jsonify({
                     'status': 'success',
                     'message': 'Data processed successfully',
                     'received_data': {
-                        'model': model,
+                        'model': model_field,
                         'user_message': user_message,
                         'role': role,
                         'stream': stream
@@ -496,10 +619,10 @@ def submit_content():
         print(f"处理请求时发生错误: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
+# ----------------- /makeGPT: 图像编辑并写入 DB -----------------
 @app.route('/makeGPT', methods=['POST'])
 def make_gpt():
-    temp_file_path = None  # 初始化变量，便于finally中判断
+    temp_file_path = None  # 初始化变量，便于 finally 中判断
 
     try:
         # 获取JSON数据
@@ -540,6 +663,23 @@ def make_gpt():
 
             print("成功获取生成的图像base64数据")
 
+            # --- 写入数据库（尽量先写入，写库失败不阻止返回） ---
+            try:
+                # 保证存入数据库的 user image 是纯 base64（不含 data: 前缀）
+                if isinstance(image_base64, str) and image_base64.startswith('data:'):
+                    store_user_b64 = image_base64.split(',', 1)[1]
+                else:
+                    store_user_b64 = image_base64
+
+                insert_gpt_log(
+                    prompt=prompt,
+                    user_img_b64=store_user_b64,
+                    output_img_b64=image_base64_out
+                )
+                print("[DB] GPT 记录已写入")
+            except Exception as e:
+                print(f"[DB] 写入 GPT 记录失败: {e}")
+
             # 返回图片数据给前端
             return jsonify({
                 'success': True,
@@ -558,9 +698,15 @@ def make_gpt():
             'success': False,
             'error': f'处理失败: {str(e)}'
         }), 500
+    finally:
+        # 清理临时文件
+        try:
+            if temp_file_path and os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+        except Exception as e:
+            print(f"删除临时文件失败: {e}")
 
-
-
+# ----------------- 启动服务器 -----------------
 if __name__ == '__main__':
     print("启动YOLOv11 Flask服务器...")
     print("=" * 50)
