@@ -1,43 +1,37 @@
+import 'package:flutter/material.dart';
+
 import '../components/bottom_nav_bar.dart';
 import '../const.dart';
-import 'package:google_nav_bar/google_nav_bar.dart';
-import 'package:flutter/material.dart';
-import 'package:animate_do/animate_do.dart';
+import 'idea_page.dart';
 import 'llama_page.dart';
 import 'profile_page.dart';
-import 'idea_page.dart';
 
-class HomePage extends StatefulWidget{
-  const HomePage({Key? key}) : super(key: key);
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
 
   @override
-  State<HomePage> createState() =>_HomePageState();
+  State<HomePage> createState() => _HomePageState();
 }
 
 class _HomePageState extends State<HomePage> {
+  int _selectedIndex = 0;
 
-  int _selectedIndex=0;
-  void navigateBottomBar(int index){
+  void _navigateBottomBar(int index) {
     setState(() {
-      _selectedIndex=index;
+      _selectedIndex = index;
     });
   }
 
-  final List<Widget>_pages=[
-    IdeaPage(),
-    llama_page(),
-    ProfilePage(),
-  ];
+  // IndexedStack keeps every page's state alive while switching tabs,
+  // so a picked image or an ongoing chat survives navigation.
+  static const List<Widget> _pages = [IdeaPage(), LlamaPage(), ProfilePage()];
 
   @override
-  Widget build(BuildContext context){
+  Widget build(BuildContext context) {
     return Scaffold(
-     backgroundColor: backgroundColor,
-     bottomNavigationBar: MyBottomNavBar(
-      onTabChange:(index) => navigateBottomBar(index),
-    ),
-    body:_pages[_selectedIndex], 
+      backgroundColor: backgroundColor,
+      bottomNavigationBar: MyBottomNavBar(onTabChange: _navigateBottomBar),
+      body: IndexedStack(index: _selectedIndex, children: _pages),
     );
   }
 }
-

@@ -43,3 +43,20 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Local backend artifacts
+lib/run/.env
+lib/run/.venv/
+lib/run/data/
+lib/run/uploads/
+lib/run/results/
+lib/run/Desktop/
+lib/run/Node_replacement/
+__pycache__/
+*.egg-info/
+
+# Windows redirect artifact
+nul
+
+# Node artifacts (node backend removed)
+node_modules/
