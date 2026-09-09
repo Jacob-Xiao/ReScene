@@ -54,6 +54,7 @@ class _IdeaPageState extends State<IdeaPage> {
   }
 
   Future<void> _sendImageToBackend() async {
+    if (_isLoading) return; // double-tap guard
     if (_selectedImage == null) {
       _showSnackBar('Please select an image!');
       return;
@@ -157,6 +158,7 @@ class _IdeaPageState extends State<IdeaPage> {
   }
 
   Future<void> _sendGPTData() async {
+    if (_isGPTLoading) return; // double-tap guard
     if (_receivedImage == null) {
       _showSnackBar('Please process an image first!');
       return;
@@ -348,7 +350,7 @@ class _IdeaPageState extends State<IdeaPage> {
   @override
   Widget build(BuildContext context) {
     // 根据是否有receivedImage决定Send to GPT按钮的颜色和可用性
-    final bool isGPTButtonEnabled = _receivedImage != null;
+    final bool isGPTButtonEnabled = _receivedImage != null && !_isGPTLoading;
 
     return Scaffold(
       appBar: AppBar(
@@ -399,7 +401,9 @@ class _IdeaPageState extends State<IdeaPage> {
                             Align(
                               alignment: Alignment.centerRight,
                               child: ElevatedButton(
-                                onPressed: _sendImageToBackend,
+                                onPressed: _isLoading
+                                    ? null
+                                    : _sendImageToBackend,
                                 style: ElevatedButton.styleFrom(
                                   backgroundColor: Colors.blue.shade600,
                                   foregroundColor: Colors.white,

@@ -13,12 +13,14 @@ this script is loaded automatically — see `.env.example`).
 """
 
 import base64
+import functools
 import io
 import json
 import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 
 import mysql.connector
@@ -31,6 +33,8 @@ from PIL import Image
 
 import cv2
 import numpy as np
+
+from concurrency_utils import SlidingWindowRateLimiter, lazy_singleton
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -57,6 +61,27 @@ app = Flask(__name__)
 # client is not subject to browser same-origin rules).
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
+
+def rate_limited(limiter):
+    """Reject requests over the per-IP limit with 429 + Retry-After."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = request.remote_addr or "unknown"
+            if not limiter.allow(key):
+                retry = max(1, int(round(limiter.retry_after(key))))
+                response = jsonify({"success": False, "error": "请求过于频繁，请稍后再试"})
+                response.status_code = 429
+                response.headers["Retry-After"] = str(retry)
+                log.warning("Rate limited %s on %s (retry after %ds)", key, fn.__name__, retry)
+                return response
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 MODEL_PATH = os.getenv("MODEL_PATH", "yolo11x-seg.pt")
 
@@ -72,11 +97,32 @@ DB_CONFIG = {
 DATA_DIR = os.path.join(APP_DIR, "data", "images")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# --- Concurrency / backpressure configuration --------------------------------
+SERVER_THREADS = int(os.getenv("SERVER_THREADS", "8"))
+MAX_YOLO_CONCURRENCY = int(os.getenv("MAX_YOLO_CONCURRENCY", "1"))
+YOLO_QUEUE_TIMEOUT = float(os.getenv("YOLO_QUEUE_TIMEOUT", "120"))
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
+GPT_RATE_LIMIT_PER_MINUTE = int(os.getenv("GPT_RATE_LIMIT_PER_MINUTE", "10"))
+
+# ultralytics inference is not guaranteed thread-safe; a semaphore keeps at
+# most MAX_YOLO_CONCURRENCY predictions in flight (default: serialized).
+_yolo_semaphore = threading.Semaphore(MAX_YOLO_CONCURRENCY)
+
+# Per-client-IP sliding window limiters; /makeGPT gets a much stricter cap
+# to protect the OpenAI quota.
+_general_limiter = SlidingWindowRateLimiter(RATE_LIMIT_PER_MINUTE, window_seconds=60.0)
+_gpt_limiter = SlidingWindowRateLimiter(GPT_RATE_LIMIT_PER_MINUTE, window_seconds=60.0)
+
+# Keep-alive session for the Ollama proxy.
+_http_session = requests.Session()
+
+# OpenAI client is created lazily so the server can start without an API key.
+get_openai_client = lazy_singleton(lambda: OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
+
 log.info("Loading YOLO model from %s ...", MODEL_PATH)
 model = YOLO(MODEL_PATH)
 log.info("Model loaded (%d classes)", len(model.names))
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 connection_pool = None
 
@@ -105,7 +151,7 @@ def ensure_database_and_tables():
 
     connection_pool = mysql.connector.pooling.MySQLConnectionPool(
         pool_name="rescene_pool",
-        pool_size=5,
+        pool_size=DB_POOL_SIZE,
         host=DB_CONFIG["host"],
         user=DB_CONFIG["user"],
         password=DB_CONFIG["password"],
@@ -208,7 +254,16 @@ def process_image_segmentation_only(image_data):
         if orig_img is None:
             raise ValueError("无法解码图片")
 
-        results = model.predict(orig_img, save=False, conf=0.25, iou=0.45, verbose=False)
+        if not _yolo_semaphore.acquire(timeout=YOLO_QUEUE_TIMEOUT):
+            return {
+                "success": False,
+                "error": "服务器繁忙，请稍后重试",
+                "retry_after": 30,
+            }
+        try:
+            results = model.predict(orig_img, save=False, conf=0.25, iou=0.45, verbose=False)
+        finally:
+            _yolo_semaphore.release()
         result = results[0]
 
         rgb_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
@@ -270,6 +325,7 @@ def base64_to_temp_file(image_base64):
 
 
 @app.route("/yolo_seg", methods=["POST"])
+@rate_limited(_general_limiter)
 def yolo_segmentation_transparent():
     start_time = time.time()
     try:
@@ -286,7 +342,8 @@ def yolo_segmentation_transparent():
 
         result = process_image_segmentation_only(image_data)
         if not result["success"]:
-            return jsonify(result), 500
+            status = 503 if result.get("retry_after") else 500
+            return jsonify(result), status
 
         img_byte_arr = io.BytesIO()
         result["segmented_image"].save(img_byte_arr, format="PNG")
@@ -345,6 +402,14 @@ def health_check():
             "status": "healthy",
             "model_loaded": model is not None,
             "model_classes": len(model.names) if model else 0,
+            "concurrency": {
+                "server_threads": SERVER_THREADS,
+                "yolo_max_concurrency": MAX_YOLO_CONCURRENCY,
+                "yolo_queue_timeout_s": YOLO_QUEUE_TIMEOUT,
+                "db_pool_size": DB_POOL_SIZE,
+                "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
+                "gpt_rate_limit_per_minute": GPT_RATE_LIMIT_PER_MINUTE,
+            },
             "timestamp": time.time(),
         }
     )
@@ -373,6 +438,7 @@ def internal_error(_e):
 
 
 @app.route("/submit_content", methods=["POST"])
+@rate_limited(_general_limiter)
 def submit_content():
     try:
         data = request.get_json()
@@ -380,7 +446,7 @@ def submit_content():
             return jsonify({"error": "No JSON data received"}), 400
 
         try:
-            response = requests.post(OLLAMA_URL, json=data, timeout=300)
+            response = _http_session.post(OLLAMA_URL, json=data, timeout=300)
         except requests.exceptions.ConnectionError:
             log.error("Cannot reach Ollama at %s", OLLAMA_URL)
             return jsonify(
@@ -407,6 +473,7 @@ def submit_content():
 
 
 @app.route("/makeGPT", methods=["POST"])
+@rate_limited(_gpt_limiter)
 def make_gpt():
     temp_file_path = None
     try:
@@ -425,7 +492,7 @@ def make_gpt():
 
         temp_file_path = base64_to_temp_file(image_base64)
 
-        response = client.images.edit(
+        response = get_openai_client().images.edit(
             model="gpt-image-1",
             image=open(temp_file_path, "rb"),
             prompt=prompt,
@@ -463,5 +530,28 @@ if __name__ == "__main__":
 
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "5000"))
-    log.info("ReScene backend listening on http://%s:%d", host, port)
-    app.run(host=host, port=port, debug=False)
+    log.info(
+        "ReScene backend listening on http://%s:%d (threads=%d, yolo_concurrency=%d,"
+        " rate_limit=%d/min, gpt_rate_limit=%d/min, db_pool=%d)",
+        host,
+        port,
+        SERVER_THREADS,
+        MAX_YOLO_CONCURRENCY,
+        RATE_LIMIT_PER_MINUTE,
+        GPT_RATE_LIMIT_PER_MINUTE,
+        DB_POOL_SIZE,
+    )
+    try:
+        from waitress import serve
+    except ImportError:
+        log.warning("waitress not installed; falling back to the Flask dev server")
+        app.run(host=host, port=port, debug=False)
+    else:
+        serve(
+            app,
+            host=host,
+            port=port,
+            threads=SERVER_THREADS,
+            connection_limit=int(os.getenv("CONNECTION_LIMIT", "100")),
+            channel_timeout=int(os.getenv("CHANNEL_TIMEOUT", "120")),
+        )

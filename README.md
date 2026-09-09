@@ -71,6 +71,28 @@ flutter run -d windows
 Backend URLs, the Llama model name, and request timeouts live in
 `lib/const.dart` (`ApiConfig`).
 
+## Concurrency & deployment
+
+The backend runs on the production WSGI server **waitress** (multi-threaded;
+gunicorn is not available on Windows) and is built for concurrent clients:
+
+- YOLO inference is serialized behind a semaphore (`MAX_YOLO_CONCURRENCY`,
+  default 1) with a bounded queue (`YOLO_QUEUE_TIMEOUT` → 503 when saturated)
+- Per-IP sliding-window rate limiting protects all endpoints; `/makeGPT` has a
+  separate, stricter cap (`GPT_RATE_LIMIT_PER_MINUTE`) to guard the OpenAI quota
+- MySQL pool size, server threads, and connection limits are env-configurable
+  (`DB_POOL_SIZE`, `SERVER_THREADS`, `CONNECTION_LIMIT`, `CHANNEL_TIMEOUT`)
+- The OpenAI client initializes lazily (server starts fine without a key)
+- The Ollama proxy reuses a keep-alive HTTP session
+
+Full design doc: [docs/high-concurrency-plan.md](docs/high-concurrency-plan.md)
+(in Chinese). Verification tooling:
+
+```
+python lib/run/test_concurrency.py      # unit tests for limiter/semaphore (stdlib only)
+python lib/run/load_test.py 64          # concurrent /health smoke test vs a running server
+```
+
 ## Testing & analysis
 
 ```

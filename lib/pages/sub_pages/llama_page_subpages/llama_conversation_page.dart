@@ -55,6 +55,7 @@ class _LlamaConversationPageState extends State<LlamaConversationPage> {
   }
 
   Future<void> _sendFeedback() async {
+    if (_isLoading) return; // double-submit guard
     final advice = _adviceController.text.trim();
     if (advice.isEmpty) {
       _showSnackBar('The input cannot be empty!');
