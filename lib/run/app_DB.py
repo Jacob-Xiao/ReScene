@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import mysql.connector
 import mysql.connector.pooling
@@ -34,6 +35,7 @@ from PIL import Image
 import cv2
 import numpy as np
 
+import auth_utils
 from concurrency_utils import SlidingWindowRateLimiter, lazy_singleton
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -63,12 +65,20 @@ app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 
 
 def rate_limited(limiter):
-    """Reject requests over the per-IP limit with 429 + Retry-After."""
+    """Reject requests over the per-user/per-IP limit with 429 + Retry-After."""
+
+    def _rate_key() -> str:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            uid = auth_utils.parse_token(auth[7:], AUTH_SECRET)
+            if uid is not None:
+                return f"u:{uid}"
+        return "ip:" + (request.remote_addr or "unknown")
 
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            key = request.remote_addr or "unknown"
+            key = _rate_key()
             if not limiter.allow(key):
                 retry = max(1, int(round(limiter.retry_after(key))))
                 response = jsonify({"success": False, "error": "请求过于频繁，请稍后再试"})
@@ -119,6 +129,29 @@ _http_session = requests.Session()
 
 # OpenAI client is created lazily so the server can start without an API key.
 get_openai_client = lazy_singleton(lambda: OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
+
+# --- Authentication / membership configuration --------------------------------
+AUTH_SECRET = os.getenv("AUTH_SECRET", "")
+if not AUTH_SECRET:
+    AUTH_SECRET = os.urandom(32).hex()
+    log.warning(
+        "AUTH_SECRET not set; generated an ephemeral secret (login sessions reset on restart)"
+    )
+
+AUTH_RATE_LIMIT_PER_MINUTE = int(os.getenv("AUTH_RATE_LIMIT_PER_MINUTE", "20"))
+_auth_limiter = SlidingWindowRateLimiter(AUTH_RATE_LIMIT_PER_MINUTE, window_seconds=60.0)
+
+# Membership catalog. Prices are in CNY for a 30-day term; checkout is a demo
+# (orders are recorded as paid immediately, no real payment gateway is called).
+MEMBERSHIP_TIERS = [
+    {"code": "free", "name": "Free", "price": 0.0, "days": 0,
+     "features": ["YOLO image segmentation", "Llama local chat", "GPT background edits"]},
+    {"code": "pro", "name": "Pro", "price": 29.0, "days": 30,
+     "features": ["Everything in Free", "Priority processing queue", "Usage history"]},
+    {"code": "studio", "name": "Studio", "price": 99.0, "days": 30,
+     "features": ["Everything in Pro", "Batch processing (coming soon)", "Dedicated support"]},
+]
+TIER_BY_CODE = {t["code"]: t for t in MEMBERSHIP_TIERS}
 
 log.info("Loading YOLO model from %s ...", MODEL_PATH)
 model = YOLO(MODEL_PATH)
@@ -182,6 +215,33 @@ def ensure_database_and_tables():
             input_image_longtext LONGTEXT,
             segmented_image_longtext LONGTEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) CHARACTER SET = utf8mb4;
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(32) NOT NULL UNIQUE,
+            password_hash VARCHAR(255) NOT NULL,
+            role VARCHAR(16) NOT NULL DEFAULT 'user',
+            membership_tier VARCHAR(16) NOT NULL DEFAULT 'free',
+            membership_expires_at DATETIME NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) CHARACTER SET = utf8mb4;
+        """
+    )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS membership_orders (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            tier VARCHAR(16) NOT NULL,
+            price DECIMAL(8, 2) NOT NULL,
+            status VARCHAR(16) NOT NULL DEFAULT 'paid',
+            expires_at DATETIME NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (id)
         ) CHARACTER SET = utf8mb4;
         """
     )
@@ -523,6 +583,369 @@ def make_gpt():
                 os.remove(temp_file_path)
             except OSError:
                 log.warning("Could not delete temp file %s", temp_file_path)
+
+
+# ============================================================================
+# Auth / membership / admin
+# ============================================================================
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso(value):
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _fetch_one(sql, params=()):
+    conn = connection_pool.get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(sql, params)
+        return cursor.fetchone()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _fetch_all(sql, params=()):
+    conn = connection_pool.get_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(sql, params)
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _execute(sql, params=()) -> int:
+    conn = connection_pool.get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql, params)
+        conn.commit()
+        return cursor.rowcount
+    finally:
+        cursor.close()
+        conn.close()
+
+
+def _membership_state(row) -> dict:
+    """Effective membership: expired subscriptions count as free."""
+    expires = row.get("membership_expires_at")
+    active = bool(expires) and expires > _utcnow().replace(tzinfo=None)
+    tier = row.get("membership_tier", "free") if active else "free"
+    return {
+        "tier": tier,
+        "expires_at": _iso(expires) if active else None,
+        "active": active and tier != "free",
+    }
+
+
+def _user_public(row) -> dict:
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "role": row["role"],
+        "membership": _membership_state(row),
+        "created_at": _iso(row.get("created_at")),
+    }
+
+
+def _get_user(user_id: int):
+    row = _fetch_one("SELECT * FROM users WHERE id = %s", (user_id,))
+    return _user_public(row) if row else None
+
+
+def _require_user():
+    """Return (user, None) or (None, (response, status))."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, (jsonify({"success": False, "error": "Not logged in"}), 401)
+    uid = auth_utils.parse_token(auth[7:], AUTH_SECRET)
+    if uid is None:
+        return None, (jsonify({"success": False, "error": "Invalid or expired session"}), 401)
+    user = _get_user(uid)
+    if user is None:
+        return None, (jsonify({"success": False, "error": "User no longer exists"}), 401)
+    return user, None
+
+
+def _require_admin():
+    user, err = _require_user()
+    if err is not None:
+        return None, err
+    if user["role"] != "admin":
+        return None, (jsonify({"success": False, "error": "Admin access required"}), 403)
+    return user, None
+
+
+@app.route("/auth/register", methods=["POST"])
+@rate_limited(_auth_limiter)
+def auth_register():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    error = auth_utils.validate_credentials(username, password)
+    if error:
+        return jsonify({"success": False, "error": error}), 400
+
+    existing = _fetch_one("SELECT id FROM users WHERE username = %s", (username,))
+    if existing:
+        return jsonify({"success": False, "error": "The username is already taken"}), 409
+
+    # Bootstrap: the first registered user becomes the admin.
+    is_first = _fetch_one("SELECT COUNT(*) AS n FROM users")["n"] == 0
+    role = "admin" if is_first else "user"
+
+    _execute(
+        "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
+        (username, auth_utils.hash_password(password), role),
+    )
+    user = _get_user(_fetch_one("SELECT id FROM users WHERE username = %s", (username,))["id"])
+    log.info("Registered user %r (role=%s)", username, role)
+    return jsonify(
+        {
+            "success": True,
+            "token": auth_utils.make_token(user["id"], AUTH_SECRET),
+            "user": user,
+        }
+    ), 201
+
+
+@app.route("/auth/login", methods=["POST"])
+@rate_limited(_auth_limiter)
+def auth_login():
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    row = _fetch_one("SELECT * FROM users WHERE username = %s", (username,))
+    if row is None or not auth_utils.verify_password(password, row["password_hash"]):
+        log.warning("Failed login for %r from %s", username, request.remote_addr)
+        return jsonify({"success": False, "error": "Incorrect username or password"}), 401
+
+    user = _user_public(row)
+    log.info("User %r logged in", username)
+    return jsonify(
+        {
+            "success": True,
+            "token": auth_utils.make_token(user["id"], AUTH_SECRET),
+            "user": user,
+        }
+    )
+
+
+@app.route("/auth/me", methods=["GET"])
+@rate_limited(_general_limiter)
+def auth_me():
+    user, err = _require_user()
+    if err is not None:
+        return err
+    return jsonify({"success": True, "user": user})
+
+
+@app.route("/membership/tiers", methods=["GET"])
+def membership_tiers():
+    return jsonify({"success": True, "tiers": MEMBERSHIP_TIERS})
+
+
+@app.route("/membership/purchase", methods=["POST"])
+@rate_limited(_general_limiter)
+def membership_purchase():
+    user, err = _require_user()
+    if err is not None:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    tier_code = data.get("tier")
+    tier = TIER_BY_CODE.get(tier_code)
+    if tier is None or tier["code"] == "free":
+        return jsonify({"success": False, "error": "Unknown membership tier"}), 400
+
+    # Demo checkout: record the order as paid immediately.
+    now = _utcnow().replace(tzinfo=None)
+    current = _membership_state(
+        _fetch_one("SELECT * FROM users WHERE id = %s", (user["id"],))
+    )
+    if current["active"] and current["tier"] == tier["code"] and current["expires_at"]:
+        base = datetime.fromisoformat(current["expires_at"]).replace(tzinfo=None)
+    else:
+        base = now
+    expires = base + timedelta(days=tier["days"])
+
+    _execute(
+        "INSERT INTO membership_orders (user_id, tier, price, status, expires_at)"
+        " VALUES (%s, %s, %s, 'paid', %s)",
+        (user["id"], tier["code"], tier["price"], expires),
+    )
+    _execute(
+        "UPDATE users SET membership_tier = %s, membership_expires_at = %s WHERE id = %s",
+        (tier["code"], expires, user["id"]),
+    )
+    log.info("User %s purchased %s (demo checkout)", user["username"], tier["code"])
+    return jsonify({"success": True, "user": _get_user(user["id"])})
+
+
+@app.route("/membership/me", methods=["GET"])
+@rate_limited(_general_limiter)
+def membership_me():
+    user, err = _require_user()
+    if err is not None:
+        return err
+    orders = _fetch_all(
+        "SELECT id, tier, price, status, expires_at, created_at FROM membership_orders"
+        " WHERE user_id = %s ORDER BY created_at DESC LIMIT 50",
+        (user["id"],),
+    )
+    for order in orders:
+        order["expires_at"] = _iso(order.get("expires_at"))
+        order["created_at"] = _iso(order.get("created_at"))
+        if hasattr(order.get("price"), "quantize"):
+            order["price"] = float(order["price"])
+    return jsonify({"success": True, "user": user, "orders": orders})
+
+
+@app.route("/admin/stats", methods=["GET"])
+@rate_limited(_general_limiter)
+def admin_stats():
+    _, err = _require_admin()
+    if err is not None:
+        return err
+
+    def _count(sql, params=()):
+        return _fetch_one(sql, params)["n"]
+
+    revenue_row = _fetch_one("SELECT COALESCE(SUM(price), 0) AS total FROM membership_orders")
+    paying = _count(
+        "SELECT COUNT(*) AS n FROM users WHERE membership_tier != 'free'"
+        " AND membership_expires_at > %s",
+        (_utcnow().replace(tzinfo=None),),
+    )
+    stats = {
+        "users": _count("SELECT COUNT(*) AS n FROM users"),
+        "paying_members": paying,
+        "orders": _count("SELECT COUNT(*) AS n FROM membership_orders"),
+        "revenue": float(revenue_row["total"]),
+        "gpt_requests": _count("SELECT COUNT(*) AS n FROM gpt_image_logs"),
+        "yolo_requests": _count("SELECT COUNT(*) AS n FROM yolo_logs"),
+    }
+    recent = _fetch_all(
+        "SELECT id, username, role, membership_tier, created_at FROM users"
+        " ORDER BY created_at DESC LIMIT 5"
+    )
+    for row in recent:
+        row["created_at"] = _iso(row.get("created_at"))
+    return jsonify({"success": True, "stats": stats, "recent_users": recent})
+
+
+@app.route("/admin/users", methods=["GET"])
+@rate_limited(_general_limiter)
+def admin_users():
+    _, err = _require_admin()
+    if err is not None:
+        return err
+    query = (request.args.get("query") or "").strip()
+    if query:
+        rows = _fetch_all(
+            "SELECT * FROM users WHERE username LIKE %s ORDER BY created_at DESC LIMIT 200",
+            (f"%{query}%",),
+        )
+    else:
+        rows = _fetch_all("SELECT * FROM users ORDER BY created_at DESC LIMIT 200")
+    return jsonify({"success": True, "users": [_user_public(r) for r in rows]})
+
+
+@app.route("/admin/users/<int:user_id>", methods=["POST"])
+@rate_limited(_general_limiter)
+def admin_update_user(user_id: int):
+    admin, err = _require_admin()
+    if err is not None:
+        return err
+
+    target = _fetch_one("SELECT * FROM users WHERE id = %s", (user_id,))
+    if target is None:
+        return jsonify({"success": False, "error": "User not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    role = data.get("role")
+    tier = data.get("tier")
+    extend_days = data.get("extend_days")
+
+    if role is not None:
+        if role not in ("user", "admin"):
+            return jsonify({"success": False, "error": "Invalid role"}), 400
+        if target["id"] == admin["id"] and role != admin["role"]:
+            return jsonify({"success": False, "error": "Cannot change your own role"}), 400
+        _execute("UPDATE users SET role = %s WHERE id = %s", (role, user_id))
+
+    if tier is not None:
+        if tier not in TIER_BY_CODE:
+            return jsonify({"success": False, "error": "Invalid tier"}), 400
+        if tier == "free":
+            _execute(
+                "UPDATE users SET membership_tier = 'free', membership_expires_at = NULL"
+                " WHERE id = %s",
+                (user_id,),
+            )
+        else:
+            expires = _utcnow().replace(tzinfo=None) + timedelta(days=TIER_BY_CODE[tier]["days"])
+            _execute(
+                "UPDATE users SET membership_tier = %s, membership_expires_at = %s WHERE id = %s",
+                (tier, expires, user_id),
+            )
+
+    if extend_days is not None:
+        try:
+            days = int(extend_days)
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "extend_days must be an integer"}), 400
+        row = _fetch_one("SELECT membership_expires_at FROM users WHERE id = %s", (user_id,))
+        base = row["membership_expires_at"]
+        if base and base > _utcnow().replace(tzinfo=None):
+            expires = base + timedelta(days=days)
+        else:
+            expires = _utcnow().replace(tzinfo=None) + timedelta(days=max(days, 0))
+        _execute(
+            "UPDATE users SET membership_tier = %s, membership_expires_at = %s WHERE id = %s",
+            ("free" if expires <= _utcnow().replace(tzinfo=None) else target["membership_tier"], expires, user_id),
+        )
+
+    log.info(
+        "Admin %s updated user %s (role=%s tier=%s extend=%s)",
+        admin["username"], target["username"], role, tier, extend_days,
+    )
+    return jsonify({"success": True, "user": _get_user(user_id)})
+
+
+@app.route("/admin/logs", methods=["GET"])
+@rate_limited(_general_limiter)
+def admin_logs():
+    _, err = _require_admin()
+    if err is not None:
+        return err
+    try:
+        limit = min(max(int(request.args.get("limit", 50)), 1), 200)
+    except ValueError:
+        limit = 50
+
+    gpt = _fetch_all(
+        "SELECT 'gpt' AS kind, g.id, NULL AS username, g.prompt AS detail, g.created_at"
+        " FROM gpt_image_logs g ORDER BY g.created_at DESC LIMIT %s",
+        (limit,),
+    )
+    yolo = _fetch_all(
+        "SELECT 'yolo' AS kind, y.id, NULL AS username, y.object_count AS detail,"
+        " y.created_at FROM yolo_logs y ORDER BY y.created_at DESC LIMIT %s",
+        (limit,),
+    )
+    merged = sorted(gpt + yolo, key=lambda r: r["created_at"] or _utcnow(), reverse=True)[:limit]
+    for row in merged:
+        row["created_at"] = _iso(row.get("created_at"))
+    return jsonify({"success": True, "logs": merged})
 
 
 if __name__ == "__main__":

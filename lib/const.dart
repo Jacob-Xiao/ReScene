@@ -12,6 +12,17 @@ class ApiConfig {
   static const String makeGptUrl = '$baseUrl/makeGPT';
   static const String submitContentUrl = '$baseUrl/submit_content';
 
+  // Auth / membership / admin.
+  static const String loginPath = '/auth/login';
+  static const String registerPath = '/auth/register';
+  static const String mePath = '/auth/me';
+  static const String tiersPath = '/membership/tiers';
+  static const String purchasePath = '/membership/purchase';
+  static const String membershipMePath = '/membership/me';
+  static const String adminStatsPath = '/admin/stats';
+  static const String adminUsersPath = '/admin/users';
+  static const String adminLogsPath = '/admin/logs';
+
   /// Model name sent to Ollama; keep in sync with `ollama pull`.
   static const String llamaModel = 'llama3';
 

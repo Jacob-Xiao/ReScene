@@ -18,8 +18,6 @@ class _LlamaPageState extends State<LlamaPage> {
         leading: null,
         title: const Text('Llama'),
         automaticallyImplyLeading: false,
-        backgroundColor: Colors.blue.shade700,
-        foregroundColor: Colors.white,
       ),
       body: ListView(
         children: <Widget>[

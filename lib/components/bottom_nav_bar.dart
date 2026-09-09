@@ -34,6 +34,11 @@ class MyBottomNavBar extends StatelessWidget {
             padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
           ),
           GButton(
+            icon: Icons.card_membership,
+            text: 'Member',
+            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          ),
+          GButton(
             icon: Icons.person,
             text: 'Profile',
             padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),

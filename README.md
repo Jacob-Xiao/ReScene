@@ -2,20 +2,27 @@
 
 ReScene — a Flutter desktop app (Windows-first) that combines YOLO
 segmentation, GPT image editing, and a local Llama chat, backed by a single
-local Python server.
+local Python server. Accounts, membership tiers and an admin console are
+built in.
 
 ## Architecture
 
 ```
 Flutter app (lib/)
-  ├─ IdeaPage        pick image -> /yolo_seg -> /makeGPT (segment + GPT background edit)
-  ├─ LlamaPage       chat -> /submit_content -> Ollama
-  └─ ProfilePage     settings placeholder
+  ├─ Login/Register   accounts (/auth/*), session persisted locally
+  ├─ IdeaPage         pick image -> /yolo_seg -> /makeGPT (segment + GPT edit)
+  ├─ LlamaPage        chat -> /submit_content -> Ollama
+  ├─ MembershipPage   tiers, demo checkout, purchase history
+  ├─ ProfilePage      account card, admin entry, logout
+  └─ AdminPage        stats, user management, request logs (role=admin)
 
-Local backend (lib/run/app_DB.py)  [Flask, 127.0.0.1:5000]
+Local backend (lib/run/app_DB.py)  [waitress, 127.0.0.1:5000]
   ├─ POST /yolo_seg         YOLO segmentation -> transparent PNG + detections
   ├─ POST /makeGPT          OpenAI gpt-image-1 background editing
   ├─ POST /submit_content   proxies chat to Ollama (http://localhost:11434)
+  ├─ POST /auth/register|login, GET /auth/me
+  ├─ GET  /membership/tiers|me, POST /membership/purchase (demo checkout)
+  ├─ GET  /admin/stats|users|logs, POST /admin/users/<id>
   ├─ GET  /health           health check
   ├─ GET  /model_info       YOLO model metadata
   └─ GET  /get_image/<f>    serves stored images from lib/run/data/images/
@@ -24,6 +31,18 @@ MySQL (optional)   request logs; images are stored on disk, paths in DB
 ```
 
 All backend configuration is environment-driven — see `lib/run/env.example`.
+
+### Accounts, membership, admin
+
+- **The first registered account automatically becomes the admin.** Set a
+  long random `AUTH_SECRET` in `.env` so sessions survive server restarts.
+- Passwords are stored as salted PBKDF2-SHA256 (200k iterations); login
+  tokens are HMAC-signed and expire after 7 days.
+- Membership checkout is a **demo**: orders are recorded as paid instantly,
+  no real payment gateway is called. Pro ¥29/30d, Studio ¥99/30d.
+- The admin console (Profile → Admin console, admin role only) shows usage
+  stats, lets you search users, change roles, set tiers and extend
+  memberships by 30 days.
 
 ## Backend setup
 

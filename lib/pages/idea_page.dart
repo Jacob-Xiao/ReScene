@@ -357,8 +357,6 @@ class _IdeaPageState extends State<IdeaPage> {
         leading: null,
         title: const Text('Idea'),
         automaticallyImplyLeading: false,
-        backgroundColor: Colors.blue.shade700,
-        foregroundColor: Colors.white,
       ),
       body: Column(
         children: <Widget>[
