@@ -1,0 +1,120 @@
+# Continuous integration for every stack in this repository.
+#
+# THIS FILE IS NOT ACTIVE. GitHub only runs workflows from
+# `.github/workflows/`, which is a protected path for the autonomous tooling
+# that maintains this repository. Install it with:
+#
+#     mkdir -p .github/workflows
+#     cp docs/ci-workflow.yml .github/workflows/ci.yml
+#     git add .github/workflows/ci.yml && git commit -m "Add CI workflow"
+#
+# Until it is installed the repository has no GitHub status checks; the
+# equivalent local commands are listed in README.md under "Testing & analysis".
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# A superseded run on the same ref is pointless once a newer commit exists.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Deliberately not requirements.txt: ultralytics/opencv (and torch) are
+      # imported lazily by app_DB, so CI stays small and GPU-free.
+      - name: Install dependencies
+        run: pip install -r lib/run/requirements-ci.txt
+
+      - name: Compile backend modules
+        run: >-
+          python -m py_compile
+          lib/run/app_DB.py
+          lib/run/auth_utils.py
+          lib/run/concurrency_utils.py
+          lib/run/retention_utils.py
+
+      - name: Concurrency primitives
+        run: python lib/run/test_concurrency.py
+
+      - name: Scaling, retention and env contract
+        run: python lib/run/test_scaling.py
+
+      - name: Auth utilities
+        run: python lib/run/test_auth.py
+
+      - name: Cross-process inference gate
+        run: python lib/run/test_multiprocess.py
+
+      # Boots the real waitress server in degraded mode and drives it over
+      # HTTP: throughput ramp, rate limiter, 503 mappings, CORS.
+      - name: Runtime load test
+        run: python lib/run/runtime_load_test.py
+
+  flutter:
+    name: Flutter client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.44.0"
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+  mobile:
+    name: React Native client
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      # A real bundling pass: proves Metro resolves every module and that
+      # expo-router discovers all routes.
+      - name: Bundle (web)
+        run: npx expo export --platform web --output-dir dist

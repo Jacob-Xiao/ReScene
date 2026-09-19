@@ -102,3 +102,66 @@ python lib/run/load_test.py 64       # 对运行中的服务做 /health 并发�
 `test_scaling.py` 刻意**不导入 `app_DB`**（其模块级依赖 ultralytics/OpenCV/MySQL，
 会让普通单测依赖模型文件与数据库），改为静态校验：可编译性、`env.example` 与代码的
 **双向一致性**、以及关键加固点未被回退。
+
+## 8. 第三轮：运行时可验证性、跨进程推理与 CI（本次）
+
+第二轮把「过载时的失效模式」修好了，但**从未在真实服务器上验证过**。根因是
+`app_DB.py` 在模块级导入 OpenCV/ultralytics 并立即加载权重：缺少任一可选依赖时进程
+根本无法启动，连 `/health` 都不可达，自然也谈不上压测。本轮先解决这个前置问题。
+
+### 8.1 优雅降级（让运行时变得可测，本身也是生产改进）
+
+| 变更 | 原因 |
+|------|------|
+| `cv2` / `ultralytics` 改为惰性导入（`load_inference_deps()`） | 缺可选依赖不再导致**整个服务无法启动**：`/ready` 能说明缺什么，`/health` 仍可观测，负载均衡仍能摘除该实例 |
+| 权重改为首次使用时加载（`get_model()`），失败结果缓存 | 之前模块导入即加载，且失败会在每个请求上重试数百 MB 的 IO |
+| 数据库初始化失败不再致命 | DB 不可用时进程仍启动，DB 相关端点返回 503，`/ready` 报 not ready |
+| 新增 `InferenceUnavailable` → 503 + `Retry-After` | 推理不可用是**可重试**状态，不该是 500 |
+
+### 8.2 跨进程推理闸门（多实例）
+
+`BoundedConcurrencyGate` 只能约束**单个进程**。同一主机跑 N 个实例时，每个实例各自
+跑 `MAX_YOLO_CONCURRENCY` 个推理 —— 正好是进程内闸门本想避免的显存超配。
+
+`CrossProcessGate` 通过锁定共享文件的**不同字节**实现主机级上限，并复用本地有界闸门
+保证排队有界。要点：
+
+- POSIX 记录锁是**按进程**的：同进程重复锁同一字节会成功并发出「幻影槽位」，因此
+  显式跳过本进程已持有的 offset
+- 锁文件不可用时**降级为进程内限流并上报 `cross_process: false`，绝不静默放行**
+- 单实例仍可用满全部预算；N 实例均分
+- 作用域仅限**同一文件系统**（即同一台机器）；跨机需要分布式锁或独立推理服务
+
+配置：`YOLO_SLOT_FILE`（默认 `data/yolo_slots.lock`，置空则退回进程内模式）、
+`YOLO_SLOT_POLL_INTERVAL`。
+
+### 8.3 实测结果
+
+**运行时压测**（`runtime_load_test.py`：真实 waitress 子进程 + HTTP，降级模式）：
+
+| 并发 | 请求数 | rps | p50 | p95 | 非 200 |
+|---|---|---|---|---|---|
+| 1 | 128 | 109.5 | 13.0ms | 16.8ms | 0 |
+| 8 | 128 | 1574.3 | 2.9ms | 20.8ms | 0 |
+| 32 | 128 | 2163.0 | 10.6ms | 13.2ms | 0 |
+| 64 | 128 | **2202.8** | 8.4ms | 12.5ms | 0 |
+
+31 项断言全部通过，其中包括：限流器在真实 HTTP 竞争下**精确放行 10 个**、20 个 429
+均带 `Retry-After`；DB 耗尽端到端返回 **503 而非 500**；未配置时无 CORS 头。
+
+**跨进程闸门对照实验**（`test_multiprocess.py`：真实 spawn 进程）：
+
+| 场景 | 结果 |
+|---|---|
+| 对照：3 进程 + 进程内闸门，容量 1 | `max_overlap = 3`（缺陷确实存在） |
+| 修复：3 进程 + `CrossProcessGate`，容量 1 | `max_overlap = 1` |
+| 分配：5 进程 + 容量 2 | `max_overlap = 2` |
+
+### 8.4 CI
+
+`.github/workflows/` 是维护本仓库的自主工具的**受保护路径**，无法自动创建。完整工作流
+（backend / flutter / mobile，含跨进程与运行时压测步骤）存放于 `docs/ci-workflow.yml`，
+安装方式见 README 的「CI (must be installed by hand)」。
+
+在该文件被安装之前，仓库**不存在任何 GitHub status check**，上述本地命令是唯一门禁。
+CI 使用 `lib/run/requirements-ci.txt`（刻意不含 ultralytics/opencv/torch，使 CI 轻量无 GPU）。

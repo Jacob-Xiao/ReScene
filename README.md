@@ -182,11 +182,25 @@ gunicorn is not available on Windows) and is built for concurrent clients:
 
 ### Scaling past one process
 
-`MAX_YOLO_CONCURRENCY`, the rate limiters and the admission gate are all
-**per process**. Running N instances behind a load balancer therefore permits
-N× concurrent inference — divide `MAX_YOLO_CONCURRENCY` accordingly, or move
-inference into its own service. The rate limiter is per instance too, so a
-cluster-wide quota needs a shared store.
+Inference is capped **host-wide**, not merely per process: every server process
+pointing at the same `YOLO_SLOT_FILE` shares a single `MAX_YOLO_CONCURRENCY`
+budget, so N instances on one box do not put N predictions on one GPU. The gate
+takes slots by locking distinct bytes of that file. Set `YOLO_SLOT_FILE=` empty
+to opt out (single-instance deployments only); if the file is unusable the gate
+degrades to in-process limiting and reports `cross_process: false` from
+`/health` rather than silently failing open.
+
+Two limits remain per process, both deliberately:
+
+- **rate limiters** — each instance counts independently, so a cluster-wide
+  quota needs a shared store
+- **filesystem scope** — the slot file only coordinates processes on one
+  machine. Across machines you need a distributed lock, or — the right answer
+  at that scale — a dedicated inference service.
+
+Measured, not asserted: `runtime_load_test.py` reports the single-instance
+ceiling and `test_multiprocess.py` proves the host-wide cap with real spawned
+processes.
 
 Full design doc: [docs/high-concurrency-plan.md](docs/high-concurrency-plan.md)
 (in Chinese). Verification tooling:
@@ -194,6 +208,8 @@ Full design doc: [docs/high-concurrency-plan.md](docs/high-concurrency-plan.md)
 ```
 python lib/run/test_concurrency.py      # limiter / gate / counters / retry (stdlib only)
 python lib/run/test_scaling.py          # retention, env contract, hardening wiring
+python lib/run/test_multiprocess.py     # cross-process gate, real spawned processes
+python lib/run/runtime_load_test.py     # boots a real waitress server, drives it over HTTP
 python lib/run/load_test.py 64          # concurrent /health smoke test vs a running server
 ```
 
@@ -202,10 +218,12 @@ python lib/run/load_test.py 64          # concurrent /health smoke test vs a run
 Every stack has a local gate; run all three before pushing.
 
 ```
-# Backend — stdlib only, needs no model, database or network
-python lib/run/test_concurrency.py
-python lib/run/test_scaling.py
-python lib/run/test_auth.py
+# Backend — needs lib/run/requirements-ci.txt; no model weights, GPU or database
+python lib/run/test_concurrency.py      # primitives
+python lib/run/test_scaling.py          # retention, env contract, hardening wiring
+python lib/run/test_auth.py             # credentials and tokens
+python lib/run/test_multiprocess.py     # cross-process inference gate
+python lib/run/runtime_load_test.py     # real waitress server driven over HTTP
 python -m py_compile lib/run/app_DB.py
 
 # Flutter client
@@ -216,83 +234,22 @@ flutter test
 npm run typecheck && npm run lint && npm test
 ```
 
-### CI (must be added by hand)
+### CI (must be installed by hand)
 
 `.github/workflows/` is a protected path for the autonomous tooling that
-maintains this repo, so the workflow below has to be created manually as
-`.github/workflows/ci.yml`. Until that file exists the repository has **no
-GitHub status checks** — the local commands above are the only gate.
+maintains this repo, so the workflow cannot be created automatically. A
+complete, ready-to-install workflow (backend / flutter / mobile) lives at
+[`docs/ci-workflow.yml`](docs/ci-workflow.yml):
 
-```yaml
-name: CI
-
-on:
-  push:
-    branches: ["**"]
-  pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-jobs:
-  backend:
-    name: Backend (python)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: Compile backend modules
-        run: >-
-          python -m py_compile
-          lib/run/app_DB.py
-          lib/run/auth_utils.py
-          lib/run/concurrency_utils.py
-          lib/run/retention_utils.py
-      - run: python lib/run/test_concurrency.py
-      - run: python lib/run/test_scaling.py
-      - run: python lib/run/test_auth.py
-
-  flutter:
-    name: Flutter client
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: subosito/flutter-action@v2
-        with:
-          flutter-version: "3.44.0"
-          channel: stable
-          cache: true
-      - run: flutter pub get
-      - run: flutter analyze
-      - run: flutter test
-
-  mobile:
-    name: React Native client
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: mobile
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: mobile/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm run lint
-      - run: npm test
-      - name: Bundle (web)
-        run: npx expo export --platform web --output-dir dist
 ```
+mkdir -p .github/workflows
+cp docs/ci-workflow.yml .github/workflows/ci.yml
+git add .github/workflows/ci.yml && git commit -m "Add CI workflow"
+```
+
+Until that file exists the repository has **no GitHub status checks** — the
+local commands above are the only gate. The template is inert where it sits:
+GitHub only runs workflows from `.github/workflows/`.
 
 ## Project layout
 

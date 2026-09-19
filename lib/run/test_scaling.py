@@ -151,9 +151,48 @@ class HardeningWiringTests(unittest.TestCase):
     def assert_wired(self, needle: str) -> None:
         self.assertIn(needle, self.source, "%r is missing from app_DB.py" % needle)
 
-    def test_bounded_yolo_gate_is_used(self):
-        self.assert_wired("_yolo_gate = BoundedConcurrencyGate(")
+    def test_cross_process_gate_is_the_default(self):
+        # The default path must be host-wide, otherwise N instances on one box
+        # each run MAX_YOLO_CONCURRENCY predictions and oversubscribe the GPU.
+        self.assert_wired("_yolo_gate = CrossProcessGate(")
+        self.assert_wired("lock_path=YOLO_SLOT_FILE")
         self.assert_wired("with _yolo_gate.acquire() as acquired:")
+
+    def test_in_process_gate_remains_available_as_opt_out(self):
+        # YOLO_SLOT_FILE="" must fall back to in-process limiting only.
+        self.assert_wired("_yolo_gate = BoundedConcurrencyGate(")
+        self.assert_wired("if YOLO_SLOT_FILE:")
+
+    def test_inference_dependencies_load_lazily(self):
+        # Eager imports meant a machine without OpenCV could not start at all,
+        # so it could not even answer /health or be drained.
+        self.assert_wired("def load_inference_deps()")
+        self.assert_wired("def get_model()")
+        self.assertNotIn(
+            "from ultralytics import YOLO  # noqa: E402",
+            self.source,
+            "ultralytics must not be imported at module scope",
+        )
+        self.assertNotIn(
+            "\nimport cv2\n",
+            self.source,
+            "opencv must not be imported at module scope",
+        )
+
+    def test_weights_are_not_loaded_at_import(self):
+        self.assertNotIn(
+            "model = YOLO(MODEL_PATH)",
+            self.source,
+            "weights must load on first use, not at import",
+        )
+        self.assert_wired("model = get_model()")
+
+    def test_inference_unavailable_maps_to_503(self):
+        self.assert_wired("class InferenceUnavailable(RuntimeError)")
+        self.assert_wired("@app.errorhandler(InferenceUnavailable)")
+
+    def test_database_failure_does_not_abort_startup(self):
+        self.assert_wired("Database unavailable at startup; DB-backed endpoints will answer 503")
 
     def test_ollama_uses_a_thread_local_session(self):
         self.assert_wired("def get_http_session()")
