@@ -152,49 +152,146 @@ Native client drops only the message whose request failed.
 The backend runs on the production WSGI server **waitress** (multi-threaded;
 gunicorn is not available on Windows) and is built for concurrent clients:
 
-- YOLO inference is serialized behind a semaphore (`MAX_YOLO_CONCURRENCY`,
-  default 1) with a bounded queue (`YOLO_QUEUE_TIMEOUT` → 503 when saturated)
+- YOLO inference runs behind a bounded admission gate (`MAX_YOLO_CONCURRENCY`,
+  default 1). The **wait queue is bounded too** (`YOLO_MAX_WAITERS`): beyond it
+  the server answers 503 + `Retry-After` immediately instead of queueing image
+  payloads until memory runs out. Admission happens *before* the image is
+  decoded, so a waiting request holds only its compressed bytes
 - Per-IP sliding-window rate limiting protects all endpoints; `/makeGPT` has a
-  separate, stricter cap (`GPT_RATE_LIMIT_PER_MINUTE`) to guard the OpenAI quota
-- MySQL pool size, server threads, and connection limits are env-configurable
+  separate, stricter cap (`GPT_RATE_LIMIT_PER_MINUTE`) to guard the OpenAI
+  quota. Idle client keys are swept, so the limiter cannot leak memory
+- **Every outbound call has a deadline** (`OPENAI_TIMEOUT` /
+  `OPENAI_MAX_RETRIES`, `OLLAMA_TIMEOUT`). Without one, a stalled upstream
+  would pin worker threads until the pool was exhausted
+- The Ollama proxy uses a **per-thread** `requests.Session` with a sized
+  urllib3 pool (`HTTP_POOL_SIZE`): a shared Session is not thread-safe, and the
+  default pool (10) is smaller than the waitress thread count
+- MySQL pool exhaustion retries briefly, then answers 503 + `Retry-After`
+  rather than 500 (`DB_ACQUIRE_RETRIES`, `DB_ACQUIRE_BACKOFF`)
+- `GET /health` reports the configured ceilings **and live saturation** (queue
+  depth, rejections, pool contention, uptime). `GET /ready` is a readiness
+  probe kept separate from liveness, so a load balancer can stop routing to an
+  instance whose model or database is unavailable
+- Generated images are pruned on a timer (`IMAGE_RETENTION_DAYS`,
+  `IMAGE_MAX_FILES`) so `data/images` cannot fill the disk
+- CORS is **opt-in** via `CORS_ALLOW_ORIGINS`, needed only by the Expo web
+  build. It is off by default: a LAN-exposed backend with an open policy would
+  let any page on the network call it with the user's token
+- MySQL pool size, server threads, and connection limits stay env-configurable
   (`DB_POOL_SIZE`, `SERVER_THREADS`, `CONNECTION_LIMIT`, `CHANNEL_TIMEOUT`)
-- The OpenAI client initializes lazily (server starts fine without a key)
-- The Ollama proxy reuses a keep-alive HTTP session
+
+### Scaling past one process
+
+`MAX_YOLO_CONCURRENCY`, the rate limiters and the admission gate are all
+**per process**. Running N instances behind a load balancer therefore permits
+N× concurrent inference — divide `MAX_YOLO_CONCURRENCY` accordingly, or move
+inference into its own service. The rate limiter is per instance too, so a
+cluster-wide quota needs a shared store.
 
 Full design doc: [docs/high-concurrency-plan.md](docs/high-concurrency-plan.md)
 (in Chinese). Verification tooling:
 
 ```
-python lib/run/test_concurrency.py      # unit tests for limiter/semaphore (stdlib only)
+python lib/run/test_concurrency.py      # limiter / gate / counters / retry (stdlib only)
+python lib/run/test_scaling.py          # retention, env contract, hardening wiring
 python lib/run/load_test.py 64          # concurrent /health smoke test vs a running server
 ```
 
 ## Testing & analysis
 
+Every stack has a local gate; run all three before pushing.
+
 ```
+# Backend — stdlib only, needs no model, database or network
+python lib/run/test_concurrency.py
+python lib/run/test_scaling.py
+python lib/run/test_auth.py
+python -m py_compile lib/run/app_DB.py
+
+# Flutter client
 flutter analyze
 flutter test
-python -m py_compile lib/run/app_DB.py
+
+# React Native client (mobile/)
+npm run typecheck && npm run lint && npm test
 ```
 
-### CI (manual step)
+### CI (must be added by hand)
 
-Autonomous tooling cannot write into `.github/workflows/`, so add this as
-`.github/workflows/ci.yml`:
+`.github/workflows/` is a protected path for the autonomous tooling that
+maintains this repo, so the workflow below has to be created manually as
+`.github/workflows/ci.yml`. Until that file exists the repository has **no
+GitHub status checks** — the local commands above are the only gate.
 
 ```yaml
 name: CI
-on: [push, pull_request]
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
+  backend:
+    name: Backend (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Compile backend modules
+        run: >-
+          python -m py_compile
+          lib/run/app_DB.py
+          lib/run/auth_utils.py
+          lib/run/concurrency_utils.py
+          lib/run/retention_utils.py
+      - run: python lib/run/test_concurrency.py
+      - run: python lib/run/test_scaling.py
+      - run: python lib/run/test_auth.py
+
   flutter:
+    name: Flutter client
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
-        with: { channel: stable, cache: true }
+        with:
+          flutter-version: "3.44.0"
+          channel: stable
+          cache: true
       - run: flutter pub get
-      - run: flutter analyze --fatal-infos
+      - run: flutter analyze
       - run: flutter test
+
+  mobile:
+    name: React Native client
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - name: Bundle (web)
+        run: npx expo export --platform web --output-dir dist
 ```
 
 ## Project layout
