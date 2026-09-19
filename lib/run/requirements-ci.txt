@@ -1,0 +1,15 @@
+# Minimal dependency set for CI.
+#
+# `requirements.txt` also pins ultralytics and opencv-python, which pull in
+# torch and add hundreds of megabytes. app_DB imports both lazily, so the HTTP
+# layer boots without them, /ready reports the missing capability, and the
+# runtime tests run in degraded mode. That keeps CI fast and GPU-free while
+# still exercising the real server.
+flask>=3.0
+waitress>=3.0
+requests>=2.31
+openai>=1.30
+python-dotenv>=1.0
+mysql-connector-python>=8.3
+Pillow>=10.0
+numpy>=1.26

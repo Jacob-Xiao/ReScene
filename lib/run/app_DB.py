@@ -32,13 +32,13 @@ from flask import Flask, jsonify, request, send_from_directory
 from openai import OpenAI
 from PIL import Image
 
-import cv2
 import numpy as np
 
 import auth_utils
 import retention_utils
 from concurrency_utils import (
     BoundedConcurrencyGate,
+    CrossProcessGate,
     MetricsRegistry,
     SlidingWindowRateLimiter,
     lazy_singleton,
@@ -63,7 +63,97 @@ ULTRALYTICS_PATH = os.getenv("ULTRALYTICS_PATH", "")
 if ULTRALYTICS_PATH and os.path.isdir(ULTRALYTICS_PATH):
     sys.path.insert(0, ULTRALYTICS_PATH)
 
-from ultralytics import YOLO  # noqa: E402  (import after optional sys.path setup)
+class InferenceUnavailable(RuntimeError):
+    """OpenCV/ultralytics are missing, or the weights failed to load.
+
+    Transient from the caller's point of view (retry, or route to another
+    instance), so it maps to 503 rather than 500.
+    """
+
+
+# Inference dependencies are imported lazily. Importing them eagerly meant a
+# missing optional dependency stopped the whole process from starting — such a
+# machine could not serve /health, be drained by a load balancer, or answer a
+# clean 503. Now the HTTP layer always boots and /ready names the missing piece.
+_cv2_module = None
+_yolo_class = None
+_deps_error = None
+
+
+def load_inference_deps():
+    """Import OpenCV and ultralytics on first use; cache the outcome."""
+    global _cv2_module, _yolo_class, _deps_error
+    if _cv2_module is not None and _yolo_class is not None:
+        return _cv2_module, _yolo_class
+    if _deps_error is not None:
+        raise InferenceUnavailable(_deps_error)
+
+    try:
+        import cv2  # noqa: PLC0415  (deliberately lazy)
+
+        try:
+            from ultralytics import YOLO  # noqa: PLC0415  (deliberately lazy)
+        except ImportError as exc:
+            raise InferenceUnavailable("ultralytics is not installed: %s" % exc) from exc
+    except InferenceUnavailable as exc:
+        _deps_error = str(exc)
+        raise
+    except ImportError as exc:
+        _deps_error = "opencv-python is not installed: %s" % exc
+        raise InferenceUnavailable(_deps_error) from exc
+
+    _cv2_module, _yolo_class = cv2, YOLO
+    return cv2, YOLO
+
+
+_model = None
+_model_error = None
+_model_lock = threading.Lock()
+
+
+def get_model():
+    """Load the YOLO weights on first use.
+
+    A failed load is cached: retrying a multi-hundred-megabyte load on every
+    request would turn one broken deployment into sustained disk and CPU
+    pressure. Returns None while inference is unavailable.
+    """
+    global _model, _model_error
+    if _model is not None or _model_error is not None:
+        return _model
+
+    with _model_lock:
+        if _model is not None or _model_error is not None:
+            return _model
+        try:
+            _, YOLO = load_inference_deps()
+            log.info("Loading YOLO model from %s ...", MODEL_PATH)
+            loaded = YOLO(MODEL_PATH)
+            log.info("Model loaded (%d classes)", len(loaded.names))
+            _model = loaded
+        except Exception as exc:  # noqa: BLE001 - any failure means "no inference"
+            _model_error = str(exc)
+            log.error("YOLO unavailable; /yolo_seg will answer 503: %s", exc)
+    return _model
+
+
+def inference_status() -> dict:
+    """Cached view of inference availability. Never triggers a weight load."""
+    deps_ok = True
+    deps_error = None
+    if _cv2_module is None or _yolo_class is None:
+        try:
+            load_inference_deps()
+        except InferenceUnavailable as exc:
+            deps_ok = False
+            deps_error = str(exc)
+    return {
+        "deps_available": deps_ok,
+        "deps_error": deps_error,
+        "model_loaded": _model is not None,
+        "model_error": _model_error,
+    }
+
 
 app = Flask(__name__)
 # Local-only desktop backend: 16 MiB upload cap. CORS stays off unless
@@ -162,15 +252,31 @@ CORS_ALLOW_ORIGINS = [
     origin.strip() for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if origin.strip()
 ]
 
+# Cross-process slot budget. Without this, N server processes on one host each
+# run MAX_YOLO_CONCURRENCY predictions and oversubscribe the GPU. Set
+# YOLO_SLOT_FILE empty to opt out (single-instance deployments only).
+YOLO_SLOT_FILE = os.getenv("YOLO_SLOT_FILE", os.path.join(APP_DIR, "data", "yolo_slots.lock"))
+YOLO_SLOT_POLL_INTERVAL = float(os.getenv("YOLO_SLOT_POLL_INTERVAL", "0.05"))
+
 # ultralytics inference is not guaranteed thread-safe, so at most
 # MAX_YOLO_CONCURRENCY predictions run at once. The wait queue is bounded too:
 # a queued request has already buffered its image, so an unbounded queue turns
-# a burst into unbounded memory growth.
-_yolo_gate = BoundedConcurrencyGate(
-    capacity=MAX_YOLO_CONCURRENCY,
-    max_waiters=YOLO_MAX_WAITERS,
-    queue_timeout=YOLO_QUEUE_TIMEOUT,
-)
+# a burst into unbounded memory growth. When a slot file is configured the same
+# budget is shared across every server process on this machine.
+if YOLO_SLOT_FILE:
+    _yolo_gate = CrossProcessGate(
+        capacity=MAX_YOLO_CONCURRENCY,
+        lock_path=YOLO_SLOT_FILE,
+        max_waiters=YOLO_MAX_WAITERS,
+        queue_timeout=YOLO_QUEUE_TIMEOUT,
+        poll_interval=YOLO_SLOT_POLL_INTERVAL,
+    )
+else:
+    _yolo_gate = BoundedConcurrencyGate(
+        capacity=MAX_YOLO_CONCURRENCY,
+        max_waiters=YOLO_MAX_WAITERS,
+        queue_timeout=YOLO_QUEUE_TIMEOUT,
+    )
 
 # Per-client-IP sliding window limiters; /makeGPT gets a much stricter cap
 # to protect the OpenAI quota.
@@ -236,10 +342,8 @@ MEMBERSHIP_TIERS = [
 ]
 TIER_BY_CODE = {t["code"]: t for t in MEMBERSHIP_TIERS}
 
-log.info("Loading YOLO model from %s ...", MODEL_PATH)
-model = YOLO(MODEL_PATH)
-log.info("Model loaded (%d classes)", len(model.names))
-
+# Weights load on the first /yolo_seg (see get_model). Loading them here would
+# mean a machine without weights could not start, health-check, or be drained.
 connection_pool = None
 
 
@@ -412,6 +516,15 @@ def insert_yolo_log(object_count, detections, input_image_path, segmented_image_
 
 def process_image_segmentation_only(image_data):
     """Run YOLO inference and return the segmented transparent-background image."""
+    model = get_model()
+    if model is None:
+        return {
+            "success": False,
+            "error": "推理服务不可用",
+            "unavailable": True,
+            "detail": _model_error,
+        }
+
     try:
         # Admission happens before decoding: a request waiting for a model slot
         # then holds only its compressed payload, not a decoded full-resolution
@@ -426,6 +539,7 @@ def process_image_segmentation_only(image_data):
                     "busy": True,
                 }
 
+            cv2, _ = load_inference_deps()
             raw, _ = _strip_data_url(image_data)
             nparr = np.frombuffer(raw, np.uint8)
             orig_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -577,8 +691,9 @@ def health_check():
     return jsonify(
         {
             "status": "healthy",
-            "model_loaded": model is not None,
-            "model_classes": len(model.names) if model else 0,
+            "model_loaded": _model is not None,
+            "model_classes": len(_model.names) if _model is not None else 0,
+            "inference": inference_status(),
             "uptime_seconds": round(time.time() - _STARTED_AT, 1),
             "concurrency": {
                 "server_threads": SERVER_THREADS,
@@ -613,7 +728,11 @@ def readiness_check():
     instance whose model or database is unavailable, instead of sending it
     requests that can only fail.
     """
-    checks = {"model_loaded": model is not None}
+    inference = inference_status()
+    # Readiness means "this instance can serve": inference dependencies are
+    # importable and the database answers. The weights themselves load on first
+    # use, so a cold instance is still ready.
+    checks = {"inference_deps": inference["deps_available"]}
     try:
         _fetch_one("SELECT 1 AS ok")
         checks["database"] = True
@@ -631,6 +750,16 @@ def readiness_check():
 
 @app.route("/model_info", methods=["GET"])
 def model_info():
+    model = get_model()
+    if model is None:
+        return jsonify(
+            {
+                "model_name": os.path.basename(MODEL_PATH),
+                "success": False,
+                "error": "推理服务不可用",
+                "detail": _model_error,
+            }
+        ), 503
     return jsonify(
         {
             "model_name": os.path.basename(MODEL_PATH),
@@ -657,6 +786,15 @@ def pool_exhausted(_e):
     response = jsonify({"success": False, "error": "服务繁忙，请稍后重试"})
     response.status_code = 503
     response.headers["Retry-After"] = "5"
+    return response
+
+
+@app.errorhandler(InferenceUnavailable)
+def inference_unavailable(_e):
+    """This instance cannot run inference; another one can."""
+    response = jsonify({"success": False, "error": "推理服务不可用", "unavailable": True})
+    response.status_code = 503
+    response.headers["Retry-After"] = "10"
     return response
 
 
@@ -1186,7 +1324,13 @@ def start_image_cleanup() -> threading.Thread:
 
 
 if __name__ == "__main__":
-    ensure_database_and_tables()
+    try:
+        ensure_database_and_tables()
+    except Exception:
+        # A missing database must not stop the process: /ready reports not
+        # ready, DB-backed endpoints answer 503, and /health stays observable
+        # so an operator can see why.
+        log.exception("Database unavailable at startup; DB-backed endpoints will answer 503")
     start_image_cleanup()
 
     host = os.getenv("HOST", "127.0.0.1")
