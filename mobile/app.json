@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "ReScene",
+    "slug": "rescene",
+    "scheme": "rescene",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.rescene.app"
+    },
+    "android": {
+      "package": "com.rescene.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "ReScene needs access to your photos so you can pick an image to segment."
+        }
+      ],
+      "expo-asset"
+    ]
+  }
+}

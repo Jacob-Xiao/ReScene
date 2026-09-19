@@ -90,6 +90,63 @@ flutter run -d windows
 Backend URLs, the Llama model name, and request timeouts live in
 `lib/const.dart` (`ApiConfig`).
 
+## React Native (Expo) client
+
+A second client lives in `mobile/` — an Expo (React Native) app that mirrors the
+Flutter screens and talks to the same local backend. The Flutter app is kept
+as-is; the two clients are independent and can be built side by side.
+
+```
+cd mobile
+npm install
+npx expo start          # then press w (web) / a (Android) / i (iOS)
+```
+
+Targets: **iOS, Android and web** (Expo SDK 57, expo-router file-based routing).
+
+Backend URLs can be overridden — something the Flutter app cannot do, and a
+requirement for a phone, which cannot reach the desktop's loopback address:
+
+```
+EXPO_PUBLIC_API_BASE_URL=http://192.168.1.20:5000 npx expo start
+```
+
+> The backend still binds to `127.0.0.1` only and sends no CORS headers. To use
+> the mobile client against a machine on the LAN you must expose it
+> (`HOST=0.0.0.0`), and the web target additionally needs CORS headers.
+
+### React Native layout
+
+```
+mobile/
+  app/                      expo-router routes (file-based)
+    _layout.tsx             AuthProvider + root Stack
+    (auth)/                 login + register; redirects once authenticated
+    (tabs)/                 Idea / Llama / Membership / Profile tab shell
+    admin.tsx               admin console (stats, users, logs)
+    llama-conversation.tsx  Ollama chat
+  src/
+    api/client.ts           ApiService (fetch; injectable for tests)
+    auth/AuthContext.tsx    session state + token storage
+    models/                 user / membership / llama payload mapping
+    components/              buttons, banners, prompt field, tab bar
+    screens/                screen implementations
+    testing/helpers.tsx     fetch + auth test doubles
+```
+
+### React Native checks
+
+```
+cd mobile
+npm run typecheck         # tsc --noEmit
+npm run lint              # eslint (eslint-config-expo)
+npm test                  # jest (jest-expo)
+```
+
+The migration intentionally changes one behaviour: the Llama chat used to keep a
+failed user message in the transcript once any earlier reply existed; the React
+Native client drops only the message whose request failed.
+
 ## Concurrency & deployment
 
 The backend runs on the production WSGI server **waitress** (multi-threaded;
