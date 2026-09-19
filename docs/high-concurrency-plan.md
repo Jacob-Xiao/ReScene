@@ -59,3 +59,46 @@
 - 按 `env.example` 新增并发相关变量（全部有默认值，可不填）
 - 数据库账户建议专用账号（非 root），`DB_POOL_SIZE ≥ SERVER_THREADS`
 - 服务只绑 `127.0.0.1`；若需局域网访问，改 `HOST=0.0.0.0` 前先加防火墙规则
+
+## 7. 第二轮升级：扩容与高负载加固（本次）
+
+第一轮解决的是「单进程内的并发正确性」。第二轮针对**过载下的失效模式**与
+**扩容（多实例 / 更多客户端类型）**。
+
+### 7.1 本轮修复的真实缺陷
+
+| # | 缺陷 | 高负载下的后果 | 修复 |
+|---|------|----------------|------|
+| 1 | `requests.Session` 模块级共享 | Session 非线程安全；默认 urllib3 连接池上限 10 < waitress 线程数 → 并发代理聊天互相饿死 | 改为**线程本地** Session，池大小可配（`HTTP_POOL_SIZE`） |
+| 2 | OpenAI `images.edit()` 无超时 | 上游挂起会**永久占住** worker 线程；占满 8 个即整机不可用 | `OPENAI_TIMEOUT` / `OPENAI_MAX_RETRIES` |
+| 3 | YOLO 等待队列无上限 | 排队请求各自持有一张已解码图像 → 内存暴涨之后才超时 | `YOLO_MAX_WAITERS` 有界队列，超出立即 503 + `Retry-After`；且**准入先于解码** |
+| 4 | 限流器 key 永不回收 | 每出现一个不同 IP/用户就永久多一个 key → 长跑内存泄漏 | 过期 key 周期性清扫，可观测 `evicted_keys_total` |
+| 5 | DB 连接池耗尽直接抛 `PoolError` | 表现为 500，客户端会当作服务端缺陷 | 短暂重试后转 503 + `Retry-After` |
+| 6 | 无就绪探针 | 负载均衡无法摘除模型/DB 不可用的实例 | `GET /ready`，与 `/health` 职责分离 |
+| 7 | `/health` 只有静态配置 | 无法判断「何时该扩容」 | 新增 `live` 区块：队列深度、拒绝数、池争用、uptime |
+| 8 | 生成图片无限堆积 | 磁盘写满 → 服务死亡 | 定时保留清理（`IMAGE_RETENTION_DAYS` / `IMAGE_MAX_FILES`） |
+| 9 | 无 CORS | Expo Web 客户端无法访问后端 | `CORS_ALLOW_ORIGINS` 可选开启（默认关闭） |
+
+### 7.2 扩容边界（重要）
+
+以下状态均为**进程内**，横向扩容时各实例不共享：
+
+- `MAX_YOLO_CONCURRENCY`：N 个实例 = N 倍并发推理。单 GPU 场景必须**按实例数均分**，
+  否则显存溢出。
+- 限流器：每实例独立计数，集群级配额需要共享存储。
+
+所以本轮的定位是：**让单实例在过载时优雅退化（快速 503，而不是被拖垮）**，并把多实例
+部署的边界显式化。真正需要水平扩容时，正确路径仍是把 YOLO 拆成独立推理服务
+（Triton/TorchServe），与第 3 节的结论一致。
+
+### 7.3 验证
+
+```
+python lib/run/test_concurrency.py   # 33 项：限流器 / 有界闸门 / 计数器 / 重试
+python lib/run/test_scaling.py       # 19 项：保留策略 / 环境变量契约 / 加固接线
+python lib/run/load_test.py 64       # 对运行中的服务做 /health 并发压测
+```
+
+`test_scaling.py` 刻意**不导入 `app_DB`**（其模块级依赖 ultralytics/OpenCV/MySQL，
+会让普通单测依赖模型文件与数据库），改为静态校验：可编译性、`env.example` 与代码的
+**双向一致性**、以及关键加固点未被回退。

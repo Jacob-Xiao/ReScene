@@ -36,7 +36,14 @@ import cv2
 import numpy as np
 
 import auth_utils
-from concurrency_utils import SlidingWindowRateLimiter, lazy_singleton
+import retention_utils
+from concurrency_utils import (
+    BoundedConcurrencyGate,
+    MetricsRegistry,
+    SlidingWindowRateLimiter,
+    lazy_singleton,
+    retry_call,
+)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -59,9 +66,24 @@ if ULTRALYTICS_PATH and os.path.isdir(ULTRALYTICS_PATH):
 from ultralytics import YOLO  # noqa: E402  (import after optional sys.path setup)
 
 app = Flask(__name__)
-# Local-only desktop backend: 16 MiB upload cap, no CORS (the Flutter desktop
-# client is not subject to browser same-origin rules).
+# Local-only desktop backend: 16 MiB upload cap. CORS stays off unless
+# CORS_ALLOW_ORIGINS names the browser origins that may call this server (the
+# Expo web build needs it; the desktop and native clients do not).
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+
+_STARTED_AT = time.time()
+
+# Live counters surfaced by /health so capacity decisions do not rely on
+# guesswork.
+_metrics = MetricsRegistry()
+
+
+class PoolExhausted(RuntimeError):
+    """No pooled database connection became available within the budget.
+
+    Distinct from a generic failure because it is transient: the client should
+    retry, so it maps to 503 + Retry-After rather than 500.
+    """
 
 
 def rate_limited(limiter):
@@ -80,6 +102,7 @@ def rate_limited(limiter):
         def wrapper(*args, **kwargs):
             key = _rate_key()
             if not limiter.allow(key):
+                _metrics.inc("rate_limited_total")
                 retry = max(1, int(round(limiter.retry_after(key))))
                 response = jsonify({"success": False, "error": "请求过于频繁，请稍后再试"})
                 response.status_code = 429
@@ -111,24 +134,84 @@ os.makedirs(DATA_DIR, exist_ok=True)
 SERVER_THREADS = int(os.getenv("SERVER_THREADS", "8"))
 MAX_YOLO_CONCURRENCY = int(os.getenv("MAX_YOLO_CONCURRENCY", "1"))
 YOLO_QUEUE_TIMEOUT = float(os.getenv("YOLO_QUEUE_TIMEOUT", "120"))
+# How many requests may block waiting for a model slot. Beyond this the server
+# answers 503 at once instead of letting queued image payloads pile up in RAM.
+YOLO_MAX_WAITERS = int(os.getenv("YOLO_MAX_WAITERS", "8"))
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
+DB_ACQUIRE_RETRIES = int(os.getenv("DB_ACQUIRE_RETRIES", "3"))
+DB_ACQUIRE_BACKOFF = float(os.getenv("DB_ACQUIRE_BACKOFF", "0.1"))
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 GPT_RATE_LIMIT_PER_MINUTE = int(os.getenv("GPT_RATE_LIMIT_PER_MINUTE", "10"))
 
-# ultralytics inference is not guaranteed thread-safe; a semaphore keeps at
-# most MAX_YOLO_CONCURRENCY predictions in flight (default: serialized).
-_yolo_semaphore = threading.Semaphore(MAX_YOLO_CONCURRENCY)
+# Outbound call budgets. A stalled upstream must never pin a worker thread
+# forever: with a bounded thread pool, enough hung calls take the whole server
+# down even though every local component is healthy.
+OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "300"))
+OPENAI_TIMEOUT = float(os.getenv("OPENAI_TIMEOUT", "180"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+HTTP_POOL_SIZE = int(os.getenv("HTTP_POOL_SIZE", str(max(SERVER_THREADS, 10))))
+
+# Generated images are pruned on a timer so the data directory cannot grow
+# until the disk fills up.
+IMAGE_RETENTION_DAYS = float(os.getenv("IMAGE_RETENTION_DAYS", "7"))
+IMAGE_MAX_FILES = int(os.getenv("IMAGE_MAX_FILES", "2000"))
+IMAGE_CLEANUP_INTERVAL_S = float(os.getenv("IMAGE_CLEANUP_INTERVAL_S", "600"))
+
+# Opt-in CORS for browser clients; empty means "send no CORS headers at all".
+CORS_ALLOW_ORIGINS = [
+    origin.strip() for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if origin.strip()
+]
+
+# ultralytics inference is not guaranteed thread-safe, so at most
+# MAX_YOLO_CONCURRENCY predictions run at once. The wait queue is bounded too:
+# a queued request has already buffered its image, so an unbounded queue turns
+# a burst into unbounded memory growth.
+_yolo_gate = BoundedConcurrencyGate(
+    capacity=MAX_YOLO_CONCURRENCY,
+    max_waiters=YOLO_MAX_WAITERS,
+    queue_timeout=YOLO_QUEUE_TIMEOUT,
+)
 
 # Per-client-IP sliding window limiters; /makeGPT gets a much stricter cap
 # to protect the OpenAI quota.
 _general_limiter = SlidingWindowRateLimiter(RATE_LIMIT_PER_MINUTE, window_seconds=60.0)
 _gpt_limiter = SlidingWindowRateLimiter(GPT_RATE_LIMIT_PER_MINUTE, window_seconds=60.0)
 
-# Keep-alive session for the Ollama proxy.
-_http_session = requests.Session()
+_http_local = threading.local()
+
+
+def get_http_session() -> requests.Session:
+    """Per-thread keep-alive session for the Ollama proxy.
+
+    requests.Session holds mutable cookie and header state and is not
+    thread-safe, and the default urllib3 pool caps at 10 connections — fewer
+    than the waitress thread count. Giving each worker thread its own session
+    and pool stops concurrent proxied chats from starving one another.
+    """
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=2,
+            pool_maxsize=HTTP_POOL_SIZE,
+            max_retries=0,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _http_local.session = session
+    return session
+
 
 # OpenAI client is created lazily so the server can start without an API key.
-get_openai_client = lazy_singleton(lambda: OpenAI(api_key=os.getenv("OPENAI_API_KEY")))
+# The timeout is what stops a stalled upstream from holding a worker thread
+# indefinitely.
+get_openai_client = lazy_singleton(
+    lambda: OpenAI(
+        api_key=os.getenv("OPENAI_API_KEY"),
+        timeout=OPENAI_TIMEOUT,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
+)
 
 # --- Authentication / membership configuration --------------------------------
 AUTH_SECRET = os.getenv("AUTH_SECRET", "")
@@ -271,11 +354,34 @@ def save_image_bytes(data, prefix):
     return path
 
 
+def _get_connection():
+    """Borrow a pooled connection, retrying briefly under contention.
+
+    mysql-connector raises PoolError the moment the pool is empty, so ordinary
+    contention under a burst would surface as a 500. A short bounded retry lets
+    the request either get a connection or fail as a retryable 503.
+    """
+    if connection_pool is None:
+        raise PoolExhausted("database pool is not initialised")
+
+    try:
+        return retry_call(
+            connection_pool.get_connection,
+            retries=DB_ACQUIRE_RETRIES,
+            backoff=DB_ACQUIRE_BACKOFF,
+            exceptions=(mysql.connector.errors.PoolError,),
+            on_error=lambda *_: _metrics.inc("db_pool_contention"),
+        )
+    except mysql.connector.errors.PoolError as exc:
+        _metrics.inc("db_pool_exhausted")
+        raise PoolExhausted(str(exc)) from exc
+
+
 def _insert_log(sql, params):
     """Insert a log row; failures are logged but never fail the HTTP request."""
     conn = cursor = None
     try:
-        conn = connection_pool.get_connection()
+        conn = _get_connection()
         cursor = conn.cursor()
         cursor.execute(sql, params)
         conn.commit()
@@ -307,23 +413,29 @@ def insert_yolo_log(object_count, detections, input_image_path, segmented_image_
 def process_image_segmentation_only(image_data):
     """Run YOLO inference and return the segmented transparent-background image."""
     try:
-        raw, _ = _strip_data_url(image_data)
+        # Admission happens before decoding: a request waiting for a model slot
+        # then holds only its compressed payload, not a decoded full-resolution
+        # RGB array.
+        with _yolo_gate.acquire() as acquired:
+            if not acquired:
+                _metrics.inc("yolo_rejected_busy")
+                return {
+                    "success": False,
+                    "error": "服务器繁忙，请稍后重试",
+                    "retry_after": 30,
+                    "busy": True,
+                }
 
-        nparr = np.frombuffer(raw, np.uint8)
-        orig_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if orig_img is None:
-            raise ValueError("无法解码图片")
+            raw, _ = _strip_data_url(image_data)
+            nparr = np.frombuffer(raw, np.uint8)
+            orig_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if orig_img is None:
+                raise ValueError("无法解码图片")
 
-        if not _yolo_semaphore.acquire(timeout=YOLO_QUEUE_TIMEOUT):
-            return {
-                "success": False,
-                "error": "服务器繁忙，请稍后重试",
-                "retry_after": 30,
-            }
-        try:
             results = model.predict(orig_img, save=False, conf=0.25, iou=0.45, verbose=False)
-        finally:
-            _yolo_semaphore.release()
+
+        # Mask assembly is CPU-only numpy work that never touches the model, so
+        # it runs after the slot has been released.
         result = results[0]
 
         rgb_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
@@ -457,21 +569,63 @@ def get_image(filename):
 
 @app.route("/health", methods=["GET"])
 def health_check():
+    """Liveness plus live saturation, so capacity decisions have real inputs.
+
+    The `concurrency` block is the configured ceiling; `live` is what is
+    actually happening right now (queue depth, rejections, pool contention).
+    """
     return jsonify(
         {
             "status": "healthy",
             "model_loaded": model is not None,
             "model_classes": len(model.names) if model else 0,
+            "uptime_seconds": round(time.time() - _STARTED_AT, 1),
             "concurrency": {
                 "server_threads": SERVER_THREADS,
                 "yolo_max_concurrency": MAX_YOLO_CONCURRENCY,
                 "yolo_queue_timeout_s": YOLO_QUEUE_TIMEOUT,
+                "yolo_max_waiters": YOLO_MAX_WAITERS,
                 "db_pool_size": DB_POOL_SIZE,
                 "rate_limit_per_minute": RATE_LIMIT_PER_MINUTE,
                 "gpt_rate_limit_per_minute": GPT_RATE_LIMIT_PER_MINUTE,
             },
+            "live": {
+                "yolo": _yolo_gate.snapshot(),
+                "db_pool": {
+                    "size": DB_POOL_SIZE,
+                    "contention_total": _metrics.get("db_pool_contention"),
+                    "exhausted_total": _metrics.get("db_pool_exhausted"),
+                },
+                "rate_limiter": _general_limiter.snapshot(),
+                "gpt_rate_limiter": _gpt_limiter.snapshot(),
+                "counters": _metrics.snapshot(),
+            },
             "timestamp": time.time(),
         }
+    )
+
+
+@app.route("/ready", methods=["GET"])
+def readiness_check():
+    """Readiness probe: 200 only when this instance can actually serve traffic.
+
+    Kept separate from /health so a load balancer can stop routing to an
+    instance whose model or database is unavailable, instead of sending it
+    requests that can only fail.
+    """
+    checks = {"model_loaded": model is not None}
+    try:
+        _fetch_one("SELECT 1 AS ok")
+        checks["database"] = True
+    except Exception as exc:  # noqa: BLE001 - any DB failure means "not ready"
+        checks["database"] = False
+        checks["database_error"] = str(exc)
+
+    ready = all(checks.values())
+    if not ready:
+        log.warning("Readiness check failed: %s", checks)
+    return jsonify({"ready": ready, "checks": checks, "timestamp": time.time()}), (
+        200 if ready else 503
     )
 
 
@@ -497,6 +651,50 @@ def internal_error(_e):
     return jsonify({"success": False, "error": "内部服务器错误"}), 500
 
 
+@app.errorhandler(PoolExhausted)
+def pool_exhausted(_e):
+    """Transient: the caller should retry once a connection frees up."""
+    response = jsonify({"success": False, "error": "服务繁忙，请稍后重试"})
+    response.status_code = 503
+    response.headers["Retry-After"] = "5"
+    return response
+
+
+@app.before_request
+def _record_request():
+    _metrics.inc("requests_total")
+    endpoint = request.endpoint or "unknown"
+    _metrics.inc("requests_by_endpoint." + endpoint)
+
+
+@app.after_request
+def _apply_cors(response):
+    """Add CORS headers when CORS_ALLOW_ORIGINS opts in.
+
+    Off by default: the desktop and native clients are not browsers, and an
+    open policy on a LAN-exposed backend would let any web page on the network
+    call it with the user's session token.
+    """
+    if not CORS_ALLOW_ORIGINS:
+        return response
+
+    origin = request.headers.get("Origin")
+    if not origin:
+        return response
+    wildcard = "*" in CORS_ALLOW_ORIGINS
+    if not wildcard and origin not in CORS_ALLOW_ORIGINS:
+        return response
+
+    response.headers["Access-Control-Allow-Origin"] = "*" if wildcard else origin
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Max-Age"] = "600"
+    if not wildcard:
+        # The response varies by origin, so caches must not share it.
+        response.headers.add("Vary", "Origin")
+    return response
+
+
 @app.route("/submit_content", methods=["POST"])
 @rate_limited(_general_limiter)
 def submit_content():
@@ -506,7 +704,7 @@ def submit_content():
             return jsonify({"error": "No JSON data received"}), 400
 
         try:
-            response = _http_session.post(OLLAMA_URL, json=data, timeout=300)
+            response = get_http_session().post(OLLAMA_URL, json=data, timeout=OLLAMA_TIMEOUT)
         except requests.exceptions.ConnectionError:
             log.error("Cannot reach Ollama at %s", OLLAMA_URL)
             return jsonify(
@@ -599,7 +797,7 @@ def _iso(value):
 
 
 def _fetch_one(sql, params=()):
-    conn = connection_pool.get_connection()
+    conn = _get_connection()
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(sql, params)
@@ -610,7 +808,7 @@ def _fetch_one(sql, params=()):
 
 
 def _fetch_all(sql, params=()):
-    conn = connection_pool.get_connection()
+    conn = _get_connection()
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(sql, params)
@@ -621,7 +819,7 @@ def _fetch_all(sql, params=()):
 
 
 def _execute(sql, params=()) -> int:
-    conn = connection_pool.get_connection()
+    conn = _get_connection()
     cursor = conn.cursor()
     try:
         cursor.execute(sql, params)
@@ -948,21 +1146,66 @@ def admin_logs():
     return jsonify({"success": True, "logs": merged})
 
 
+def _image_cleanup_loop(stop_event: threading.Event) -> None:
+    while True:
+        try:
+            summary = retention_utils.prune_files(
+                DATA_DIR,
+                max_age_seconds=IMAGE_RETENTION_DAYS * 86400,
+                max_files=IMAGE_MAX_FILES,
+            )
+        except Exception:
+            log.exception("Image cleanup failed")
+        else:
+            if summary["removed"]:
+                log.info(
+                    "Image cleanup removed %d file(s), freed %.1f MiB, kept %d",
+                    summary["removed"],
+                    summary["freed_bytes"] / 1048576.0,
+                    summary["kept"],
+                )
+        if stop_event.wait(IMAGE_CLEANUP_INTERVAL_S):
+            return
+
+
+def start_image_cleanup() -> threading.Thread:
+    """Prune data/images on a daemon timer so the disk cannot fill up.
+
+    Runs once at startup (to clean up after downtime) and then every
+    IMAGE_CLEANUP_INTERVAL_S. Daemon so it never blocks interpreter exit.
+    """
+    stop_event = threading.Event()
+    thread = threading.Thread(
+        target=_image_cleanup_loop,
+        args=(stop_event,),
+        name="image-cleanup",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
 if __name__ == "__main__":
     ensure_database_and_tables()
+    start_image_cleanup()
 
     host = os.getenv("HOST", "127.0.0.1")
     port = int(os.getenv("PORT", "5000"))
     log.info(
-        "ReScene backend listening on http://%s:%d (threads=%d, yolo_concurrency=%d,"
-        " rate_limit=%d/min, gpt_rate_limit=%d/min, db_pool=%d)",
+        "ReScene backend listening on http://%s:%d (threads=%d, yolo_concurrency=%d"
+        " max_waiters=%d, rate_limit=%d/min, gpt_rate_limit=%d/min, db_pool=%d,"
+        " image_retention=%dd/%d files, cors=%s)",
         host,
         port,
         SERVER_THREADS,
         MAX_YOLO_CONCURRENCY,
+        YOLO_MAX_WAITERS,
         RATE_LIMIT_PER_MINUTE,
         GPT_RATE_LIMIT_PER_MINUTE,
         DB_POOL_SIZE,
+        int(IMAGE_RETENTION_DAYS),
+        IMAGE_MAX_FILES,
+        ",".join(CORS_ALLOW_ORIGINS) if CORS_ALLOW_ORIGINS else "off",
     )
     try:
         from waitress import serve
